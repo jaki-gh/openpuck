@@ -274,31 +274,40 @@ offset  size  meaning
 
 The RF side stays the same across modes. Only USB enumeration changes.
 
+There are three switchable modes (`0=Steam 1=Xbox 2=Switch`). Steam mode is a CDC + WebUSB composite;
+Xbox and Switch are **clean, non-composite, single-function** devices — the auto-added CDC/WebUSB
+interfaces are torn down (`clearConfiguration`) and `bcdUSB` stays `0x0200` (no USB-2.1 BOS). This is
+required because Windows' `xusb` driver matches `045E:028E` at the device level (a composite hides the
+gamepad behind an `MI_xx`) and a real Switch console rejects composite devices. Every boot/mode-switch
+does a `detach -> rebuild -> attach` so the host re-reads the descriptor cleanly.
+
 ### 9.1 Steam mode
 
 - VID:PID `28DE:1304`
-- Four puck HID interfaces
+- Four puck HID interfaces (CDC + WebUSB also present)
 - `0x45` reports are forwarded to the connected slot's HID interface
+- **Seamless lizard**: when Steam's `0x87` heartbeat is alive, `0x45` is forwarded; when it stops
+  (Steam closed, 7 s watchdog) the same `0x45` is translated into mouse (`0x40`) + keyboard (`0x41`)
+  reports on the **same** puck interface, so the device is a driverless desktop keyboard+mouse with no
+  mode switch. This is purely USB-side; the RF poll and relay are unchanged. (There is no standalone
+  lizard mode.)
 
 ### 9.2 Xbox mode
 
-- VID:PID `045E:028E`
-- Custom XInput-compatible vendor interface
-- Separate HID mouse for right-pad mouse emulation
+- VID:PID `045E:028E`, clean device (no CDC/WebUSB)
+- Custom XInput-compatible vendor interface on `MI_00` + a HID mouse on `MI_01` (right-pad emulation)
 - `0x45` is converted into a 20-byte XInput report
 
 ### 9.3 Switch mode
 
-- VID:PID `057E:2009`
-- Single HID interface compatible with Switch Pro host expectations
-
-### 9.4 Lizard mode
-
-- Keyboard and mouse USB presentation
+- VID:PID `0F0D:0092` (HORI Pokkén Tournament Pro Pad), clean device (no CDC/WebUSB)
+- Single HID interface with the canonical HORIPAD descriptor (interrupt IN + OUT endpoints), accepted by
+  a real Switch console with no handshake; an 8-byte report is streamed at ~125 Hz
 
 ## 10. WebUSB control channel
 
-The WebUSB vendor interface is present in every mode.
+The WebUSB vendor interface is present only in Steam mode (Xbox/Switch are clean controllers with no
+config interface — configure them from Steam mode or switch via the back-paddle chord).
 
 Messages:
 
@@ -356,6 +365,6 @@ To build a compatible puck from scratch:
 6. Poll with `E7` then `E3 GET 0x45`.
 7. Parse `F1` and unpack report `0x45`.
 8. Relay host feature writes to the controller as `E3` SET sub-TLVs.
-9. Re-enumerate USB cleanly when switching Steam/Xbox/Switch/Lizard modes.
+9. Re-enumerate USB cleanly when switching Steam/Xbox/Switch modes (Xbox/Switch as clean non-composite devices).
 
 If those pieces match, the controller-to-puck protocol is fully reimplemented.

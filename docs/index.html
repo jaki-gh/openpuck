@@ -42,10 +42,10 @@
 
   <div class="card" id="connectCard">
     <div class="row" style="margin:0">
-      <button id="connectBtn" class="primary">Connect to OpenPuck</button>
+      <button id="connectBtn" class="primary">Connect to copycat</button>
       <span id="connState" class="pill dn">disconnected</span>
     </div>
-    <p class="note">If nothing appears in the device picker, OpenPuck may be busy, already claimed by another app, or needs a replug. This page also works when published through GitHub Pages because WebUSB only requires a secure context.</p>
+    <p class="note">If nothing appears in the device picker, the copycat may be busy (quit any app holding it) or needs a replug. Serve this page over <code>http://localhost</code> (e.g. <code>python3 -m http.server 8008</code>) — WebUSB needs a secure context.</p>
   </div>
 
   <div id="panel" class="hide">
@@ -55,9 +55,8 @@
         <button data-mode="0" class="modebtn">Steam (puck)</button>
         <button data-mode="1" class="modebtn">Xbox 360</button>
         <button data-mode="2" class="modebtn">Switch Pro</button>
-        <button data-mode="3" class="modebtn">Lizard (kbd+mouse)</button>
       </div>
-      <p class="note">Switching reboots OpenPuck and re-enumerates USB (~2 s). The RF link reconnects automatically.</p>
+      <p class="note">Switching reboots the copycat and re-enumerates USB (~2 s). The RF link reconnects automatically. Desktop keyboard+mouse (lizard) is automatic in Steam mode whenever Steam is closed — no separate mode.</p>
       <div class="row"><label>Persist last mode</label>
         <button id="persistMode">off</button>
         <span class="note" style="flex:1">Off (default): every restart / fresh reconnect boots into Steam mode. On: remembers the last mode you selected.</span>
@@ -100,10 +99,10 @@
 
 
     <div class="card" id="mouseCard">
-      <h2>Xbox-mode trackpad mouse</h2>
+      <h2>Trackpad mouse (lizard + Xbox)</h2>
       <div class="row"><label>Sensitivity</label><input type="range" id="mDiv" min="4" max="200" step="1"><span class="val" id="mDivV"></span></div>
       <div class="row"><label>Glide / friction</label><input type="range" id="mFric" min="0" max="99" step="1"><span class="val" id="mFricV"></span></div>
-      <p class="note">Sensitivity is a divisor — lower = faster pointer. Glide = how long the cursor coasts after a flick.</p>
+      <p class="note">Right-pad cursor in Steam-mode lizard (Steam closed) and in Xbox mode. Sensitivity is a divisor — lower = faster pointer. Glide = how long the cursor coasts after a flick.</p>
     </div>
 
     <div class="card" id="steamCard">
@@ -122,7 +121,7 @@
       <div class="row"><label>R4 (back upper-right)</label><select class="back" data-i="1"></select></div>
       <div class="row"><label>L5 (back lower-left)</label><select class="back" data-i="2"></select></div>
       <div class="row"><label>R5 (back lower-right)</label><select class="back" data-i="3"></select></div>
-      <p class="note">Back-paddle → button, applied in Xbox mode.</p>
+      <p class="note">Back-paddle → button, applied in Xbox &amp; Switch modes.</p>
     </div>
 
     <div id="log"></div>
@@ -130,7 +129,7 @@
 </div>
 
 <script>
-const MODE_NAMES = ["Steam (puck)","Xbox 360","Switch Pro","Lizard (kbd+mouse)"];
+const MODE_NAMES = ["Steam (puck)","Xbox 360","Switch Pro"];
 const BTN_CODES = [[0,"— none —"],[1,"A"],[2,"B"],[3,"X"],[4,"Y"],[5,"LB"],[6,"RB"],[7,"L3"],[8,"R3"],[9,"Back"],[10,"Start"],[11,"Guide"]];
 let dev=null, epIn=0, epOut=0, ifNum=0, polling=false;
 const $ = s=>document.querySelector(s);
@@ -143,7 +142,7 @@ for(const sel of document.querySelectorAll("select.back")){
 
 async function connect(){
   try{
-    dev = await navigator.usb.requestDevice({filters:[{vendorId:0x28DE},{vendorId:0x045E},{vendorId:0x057E}]});
+    dev = await navigator.usb.requestDevice({filters:[{vendorId:0x28DE},{vendorId:0x045E},{vendorId:0x057E},{vendorId:0x0F0D}]});
     await dev.open();
     if(dev.configuration===null) await dev.selectConfiguration(1);
     // find the WebUSB vendor interface: class 0xFF with one bulk-IN + one bulk-OUT (XInput is 0xFF but interrupt; CDC data is 0x0A)
@@ -248,7 +247,7 @@ for(const sel of document.querySelectorAll("select.back")){
   sel.addEventListener("change", ()=>setField(5 + +sel.dataset.i, +sel.value));
 }
 for(const b of document.querySelectorAll(".modebtn")){
-  b.onclick=()=>{ if(confirm("Switch to "+MODE_NAMES[+b.dataset.mode]+"? OpenPuck will reboot.")){ send([0x03, +b.dataset.mode]); log("mode switch requested — device will reboot"); } };
+  b.onclick=()=>{ if(confirm("Switch to "+MODE_NAMES[+b.dataset.mode]+"? The copycat will reboot.")){ send([0x03, +b.dataset.mode]); log("mode switch requested — device will reboot"); } };
 }
 if(!("usb" in navigator)) $("#connectBtn").outerHTML='<b style="color:var(--bad)">WebUSB not supported — use Chrome or Edge.</b>';
 </script>

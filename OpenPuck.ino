@@ -1,19 +1,24 @@
 // OpenPuck.ino -- Steam Controller 2 ("Triton") puck reimplementation for an nRF52840.
 //
 // This sketch impersonates the Valve puck over USB, maintains puck-style bond slots, speaks the
-// reverse-engineered RF protocol to the controller, and can re-enumerate into Steam, Xbox, Switch,
-// or lizard modes. The real puck exposes four separate HID control interfaces; interface N owns
-// bond slot N, so this sketch does the same. Build with -DCFG_TUD_HID=4.
+// reverse-engineered RF protocol to the controller, and re-enumerates into Steam, Xbox, or Switch
+// personalities. The real puck exposes four separate HID control interfaces; interface N owns bond
+// slot N, so this sketch does the same. Build with -DCFG_TUD_HID=4 (the Adafruit nRF port defaults to 2).
+//
+// USB presentations: Steam = the genuine 4-slot Valve puck (28DE:1304) with the feature-report command
+// channel (0x83/0xAE/0xB4/0xA3/0xA2/0xAD); desktop keyboard+mouse "lizard" is automatic when Steam is
+// closed. Xbox = a clean XInput controller (045E:028E) + right-pad mouse. Switch = a HORIPAD pad
+// (0F0D:0092). Xbox/Switch are non-composite (no CDC/WebUSB) so strict hosts bind them.
+//
+// Protocol reference: docs/PROTOCOL.md.  Bond record = [8 uuid][16 serial].
 
 #include <Adafruit_TinyUSB.h>
 #include <Adafruit_LittleFS.h>
 #include <InternalFileSystem.h>
-
 // custom class-driver API (usbd_class_driver_t, usbd_edpt_*) for the XInput interface
 extern "C" {
 #include "device/usbd_pvt.h"
 }
-
 // Bounded radio-disable wait: NEVER spin forever. A wedged RADIO peripheral would otherwise hang the whole
 // main loop (and USB stops being serviced -> device "dies" until replug). On timeout we bail and continue;
 // the next rfConfig re-inits the radio.
@@ -60,11 +65,9 @@ Adafruit_USBD_HID hid[NSLOT];
 // flash and a button combo (back4+X -> xbox, back4+A -> steam) saves it and reboots, so each boot enumerates
 // the right interface set. RF (beacon/poll/bonds) is identical in both modes; only the USB side differs.
 static const uint8_t MOUSE_HID_DESC[] = { TUD_HID_REPORT_DESC_MOUSE() };
-Adafruit_USBD_HID g_mouse;   // Xbox/Lizard-mode mouse interface (right trackpad)
-static const uint8_t KEYBOARD_HID_DESC[] = { TUD_HID_REPORT_DESC_KEYBOARD() };
-Adafruit_USBD_HID g_keyboard;   // Lizard-mode keyboard interface (buttons -> keys)
-static uint8_t g_usbMode = 0;   // 0=STEAM(puck) 1=XBOX(xinput) 2=SWITCH 3=LIZARD(kbd+mouse); loaded from flash at boot
-static bool    g_xbox = false;   // == (g_usbMode != 0); kept for the existing puck-vs-other checks (true for xbox/switch/lizard)
+Adafruit_USBD_HID g_mouse;   // Xbox-mode mouse interface (right trackpad). Steam-mode lizard reuses the puck's own 0x40 mouse report instead.
+static uint8_t g_usbMode = 0;   // 0=STEAM(puck; auto-lizard when Steam closed) 1=XBOX(xinput+mouse) 2=SWITCH(HORIPAD); loaded from flash at boot
+static bool    g_xbox = false;   // == (g_usbMode != 0); kept for the existing puck-vs-other checks (true for xbox/switch)
 // Mode persistence policy: by DEFAULT every fresh power-on/reconnect lands in STEAM mode (0). An explicit
 // mode switch still works for the session via a ONE-SHOT bootMode (honored once, then cleared, so the next
 // cold boot reverts to Steam). The WebUI "persist last mode" toggle (g_persistMode) instead remembers the
@@ -75,8 +78,6 @@ volatile uint8_t g_rumble = 0;   // Xbox-mode rumble strength from the host's XI
 volatile unsigned long g_rumbleMs = 0;   // millis of last rumble OUT packet (declared here — used by xi_xfer above the watchdog block); stuck-rumble watchdog
 // persisted, runtime-tunable config (Cfg struct + load/saveCfg below; CDC M/F/D/W/B + WebUSB set these):
 static int     g_mDiv = 64, g_mFric = 94, g_padSmooth = 35;  // xbox mouse sens/friction%, steam pad smoothing%
-static int     g_lizDiv = 320;   // LIZARD right-pad mouse sensitivity divisor (higher=slower; desktop cursor wants way less than Xbox aim). CDC 'n'.
-static int     g_lizFric = 88;   // LIZARD right-pad mouse friction% (lower=less glide/crisper, higher=more coast). Tuned by feel (divisor 320 / friction 88). CDC 'm'.
 static uint8_t g_abSwap = 0;                 // 1 = swap A/B and X/Y (Nintendo face-button layout)
 static uint8_t g_back[4] = {5,6,7,8};        // back paddles L4,R4,L5,R5 -> button codes (see codeToXB; 5=LB 6=RB 7=L3 8=R3)
 static uint32_t g_pollUs = 800;              // RF poll cadence (us). LOCKED default: 800us is the measured peak (~706 polls/s -> ~400 new/s with PID cycling; below 800 = RX-turnaround-limited, above 800 declines). NOT persisted — WebUSB/CDC 'U' tune it for the session only, reverts to 800 on reboot.
@@ -95,9 +96,9 @@ static volatile uint16_t g_qosBad = 0;       // crcfail+noRx accumulated since l
 static unsigned long g_qosCheckMs = 0, g_qosLastHopMs = 0;
 
 // WebUSB config channel — a dedicated vendor interface present in every mode so the browser panel
-// can read/set the tunables above. Protocol + poll in webusbPoll() below.
+// (copycat_config.html) can read/set the tunables above. Protocol + poll in webusbPoll() below.
 // NOTE: no setLandingPage() — that would make Chrome pop a "device detected, open <url>" notification
-// every plug-in. The interface works without it; the user just opens the published WebUSB page themselves.
+// every plug-in. The interface works without it; the user just opens copycat_config.html themselves.
 Adafruit_USBD_WebUSB usb_web;
 
 // ===================== XInput (Xbox 360 wired) device — Xbox-mode gamepad =====================
@@ -107,14 +108,12 @@ Adafruit_USBD_WebUSB usb_web;
 // the FF/5D/01 interface. (Verified against Adafruit nRF52 1.7.0 / TinyUSB 0.18.)  XInput button bits:
 enum { XB_DUP=0x0001,XB_DDOWN=0x0002,XB_DLEFT=0x0004,XB_DRIGHT=0x0008, XB_START=0x0010,XB_BACK=0x0020,
        XB_L3=0x0040,XB_R3=0x0080, XB_LB=0x0100,XB_RB=0x0200,XB_GUIDE=0x0400, XB_A=0x1000,XB_B=0x2000,XB_X=0x4000,XB_Y=0x8000 };
-
 #define XINPUT_DESC_LEN (9 + 17 + 7 + 7)   // interface(9)+vendor0x21(17)+IN ep(7)+OUT ep(7) = 40
 static uint8_t g_xiItf=0xFF, g_xiEpIn=0, g_xiEpOut=0;
 static uint8_t g_xiInBuf[32], g_xiOutBuf[32];
 static void xi_init(void){}
 static bool xi_deinit(void){return true;}
 static void xi_reset(uint8_t rhport){(void)rhport; g_xiEpIn=g_xiEpOut=0;}
-
 static uint16_t xi_open(uint8_t rhport, tusb_desc_interface_t const* itf, uint16_t max_len){
   if(!(itf->bInterfaceClass==0xFF && itf->bInterfaceSubClass==0x5D && itf->bInterfaceProtocol==0x01)) return 0;
   g_xiItf=itf->bInterfaceNumber;
@@ -131,9 +130,7 @@ static uint16_t xi_open(uint8_t rhport, tusb_desc_interface_t const* itf, uint16
   if(g_xiEpOut) usbd_edpt_xfer(rhport,g_xiEpOut,g_xiOutBuf,sizeof g_xiOutBuf);  // arm OUT (rumble/LED)
   return used;
 }
-
 static bool xi_ctrl(uint8_t rhport,uint8_t stage,tusb_control_request_t const* req){(void)rhport;(void)req; return stage!=CONTROL_STAGE_SETUP;}
-
 static bool xi_xfer(uint8_t rhport,uint8_t ep,xfer_result_t res,uint32_t n){(void)res;
   if(ep==g_xiEpOut){
     // XInput rumble packet: [00][08][00][bigMotor][smallMotor][00][00][00]; LED pkt is [01][03][led]
@@ -143,7 +140,6 @@ static bool xi_xfer(uint8_t rhport,uint8_t ep,xfer_result_t res,uint32_t n){(voi
     usbd_edpt_xfer(rhport,g_xiEpOut,g_xiOutBuf,sizeof g_xiOutBuf);    // re-arm OUT
   }
   return true; }
-
 static const usbd_class_driver_t g_xiDriver = {
 #if CFG_TUSB_DEBUG>=2
   .name="XINPUT",
@@ -152,7 +148,7 @@ static const usbd_class_driver_t g_xiDriver = {
   .control_xfer_cb=xi_ctrl, .xfer_cb=xi_xfer, .sof=NULL };
 extern "C" const usbd_class_driver_t* usbd_app_driver_get_cb(uint8_t* count){ *count=1; return &g_xiDriver; }
 class Adafruit_USBD_XInput : public Adafruit_USBD_Interface {
- public:
+public:
   uint16_t getInterfaceDescriptor(uint8_t, uint8_t* buf, uint16_t bufsize) override {
     if(!buf) return XINPUT_DESC_LEN; if(bufsize<XINPUT_DESC_LEN) return 0;
     uint8_t itfnum=TinyUSBDevice.allocInterface(1);
@@ -166,7 +162,6 @@ class Adafruit_USBD_XInput : public Adafruit_USBD_Interface {
   }
   bool begin(){ return TinyUSBDevice.addInterface(*this); }
 };
-
 Adafruit_USBD_XInput g_xinput;
 static void xinputSend(uint16_t buttons,uint8_t lt,uint8_t rt,int16_t lx,int16_t ly,int16_t rx,int16_t ry){
   if(!tud_mounted() || g_xiEpIn==0 || usbd_edpt_busy(0,g_xiEpIn)) return;
@@ -180,6 +175,7 @@ static void xinputSend(uint16_t buttons,uint8_t lt,uint8_t rt,int16_t lx,int16_t
 // ---- identity: a UNIQUE serial from the FICR DEVICEID (never clashes with a real puck) ----
 static char g_unit[16];   // "FXB99602xxxxx"
 static char g_board[16];  // "MXB99602xxxxx"
+static char g_usbSerial[18];   // per-mode USB serial (Steam uses g_unit; others get a suffix — see setup)
 static const uint8_t ATTR83[] = {     // 0x83 attributes (product 0x1304 = puck)
   0x01,0x04,0x13,0x00,0x00,0x02,0x00,0x00,0x00,0x00,0x0A,0xF2,0xF9,0xD2,0x68,
   0x04,0x53,0xD0,0x18,0x6A,0x09,0x47,0x00,0x00,0x00 };
@@ -192,7 +188,7 @@ static int           g_connSlot = -1;    // bonded slot being polled (== the USB
 static unsigned long g_connReplyMs = 0;  // millis of last RF reply (link-alive timestamp)
 // host->controller relay: Steam writes feature report id 0x01 (raw passthrough) carrying a controller
 // feature report [report-id][len][payload...] (e.g. 87 03 09 00 00 = settings: lizard-mode off). The real
-// dongle forwards it to the controller as a SET sub-TLV in the E3 poll; OpenPuck does the same.
+// dongle forwards it to the controller as a SET sub-TLV in the E3 poll; the copycat must do the same.
 static volatile bool g_relayPend = false;
 static uint8_t       g_relayBuf[24];
 static volatile uint8_t g_relayN = 0;
@@ -207,12 +203,14 @@ static unsigned long g_haptic82Ms = 0;            // millis of last 0x82 haptic 
 static bool          g_haptic82On = false;        // a non-zero 0x82 haptic is currently active (awaiting host stop)
 #define RUMBLE_STUCK_MS   2500u   // Xbox: release a held rumble if no OUT packet refreshes it for this long (covers a lost stop without cutting normal short rumbles)
 #define HAPTIC_QUIET_MS    300u   // Steam: if 0x82 haptics go silent this long after being active, send an explicit off (glide stream is ~25ms-spaced, so 300ms silence = really stopped)
-// Auto-lizard: Steam, while running, re-sends settings report 0x87 id 0x09 (lizard-off) every ~3s as a
-// heartbeat (captured on hardware). While that heartbeat is alive we forward the gamepad report 0x45 to
-// Steam; when it stops (Steam closed) we fall back to lizard — mouse(0x40)+keyboard(0x41) on the SAME puck
-// interface, exactly like the real controller. g_steamAliveMs=0 at boot => lizard active until Steam appears.
-static unsigned long g_steamAliveMs = 0;   // millis of last 0x87 settings write from Steam (its lizard-off heartbeat)
-#define LIZARD_WD_MS 7000u   // Steam-mode lizard kicks in this long after the 0x87 heartbeat stops (>2x the 3s cadence, so a single missed beat won't trip it mid-session)
+// Seamless lizard (Steam mode): exactly like the real puck — when Steam is running it forwards the gamepad
+// report 0x45; when Steam is closed it drives mouse(0x40)+keyboard(0x41) on the SAME puck interface. This is
+// a PURELY USB-SIDE decision — it changes nothing about the RF poll or the host->controller relay, so the
+// controller is polled identically whether Steam is up or not and can't be pushed into a non-puck state.
+// Steam, while running, re-sends settings report 0x87 (lizard-off) every ~3s as a heartbeat (captured on HW).
+static unsigned long g_steamAliveMs = 0;   // millis of last 0x87 settings write from Steam (its heartbeat); 0 at boot => lizard until Steam appears
+#define LIZARD_WD_MS 7000u          // fall back to lizard this long after the 0x87 heartbeat stops (>2x the 3s cadence, so one missed beat won't trip it mid-session)
+static bool g_autoLizard = true;    // master switch; false => Steam mode always forwards 0x45 (the prior behavior). Opening Steam also disables lizard instantly (its 0x87 heartbeat sets steamAlive).
 #define BOND_FILE "/bonds.bin"
 static volatile bool g_dirty = false;
 static bool g_pairing = false;
@@ -232,7 +230,6 @@ static void saveBonds() {
     f.close();
   }
 }
-
 #define CFG_FILE "/cfg.bin"
 #define CFG_MAGIC 0xC6   // bumped (added persistMode+bootMode): old cfg ignored -> clean defaults on first boot
 struct Cfg { uint8_t magic, mode, mDiv, mFric, padSmooth, abSwap, back[4], pollU100, persistMode, bootMode; };
@@ -251,14 +248,13 @@ static void loadCfg(){
       g_persistMode = c.persistMode?true:false;
       // boot-mode policy: a one-shot bootMode (set by an explicit switch when !persist) wins once and is then
       // cleared; otherwise persist->last mode, else->Steam. (poll rate stays the locked 800us default — never restored.)
-      if(c.bootMode!=0xFF){ g_usbMode=(c.bootMode<=3)?c.bootMode:0; consume=true; }
-      else                 g_usbMode = g_persistMode ? ((c.mode<=3)?c.mode:0) : 0;
+      if(c.bootMode!=0xFF){ g_usbMode=(c.bootMode<=2)?c.bootMode:0; consume=true; }   // 0=Steam 1=Xbox 2=Switch (mode 3/Lizard removed; old cfgs fall back to Steam)
+      else                 g_usbMode = g_persistMode ? ((c.mode<=2)?c.mode:0) : 0;
     }
     f.close();
   }
   if(consume){ g_bootMode=0xFF; saveCfg(); }   // clear the one-shot so the NEXT cold boot reverts to the default/persist policy
 }
-
 // Mode switch (chord / WebUI): persist mode if the toggle is on, else arm a one-shot so this reboot lands in
 // the new mode but the next cold boot returns to Steam. Either way saveCfg + caller reboots.
 static void saveMode(uint8_t m){
@@ -293,7 +289,7 @@ static void handleSet(int slot, uint8_t rid, hid_report_type_t type, uint8_t con
   Slot &S = g_slot[slot];
   uint8_t cmd = b[0], len = (n > 1) ? b[1] : 0;
   const uint8_t *pl = b + 2; uint16_t pln = (n >= 2) ? n - 2 : 0;
-  if (cmd == 0x87) g_steamAliveMs = millis();   // Steam's lizard-off heartbeat (settings 0x87, ~every 3s) -> keep gamepad mode, suppress auto-lizard
+  if (cmd == 0x87) g_steamAliveMs = millis();   // Steam's settings/lizard-off heartbeat (~every 3s) -> keep forwarding gamepad, suppress auto-lizard
   if (rid == 1 && n >= 2) {   // report 0x01 = raw passthrough -> queue for RF relay to the controller
     uint16_t m = n > sizeof g_relayBuf ? sizeof g_relayBuf : n;
     memcpy(g_relayBuf, b, m); g_relayN = m; g_relayPend = true;
@@ -305,33 +301,32 @@ static void handleSet(int slot, uint8_t rid, hid_report_type_t type, uint8_t con
   }
   memset(S.resp, 0, sizeof S.resp); S.resp_len = 0;
   switch (cmd) {
-  case 0x83:
-    S.resp[0] = 0x83; S.resp[1] = sizeof ATTR83; memcpy(S.resp + 2, ATTR83, sizeof ATTR83); S.resp_len = 63; break;
-  case 0xAE: {
-    uint8_t idx = pln > 0 ? pl[0] : 1; const char *s = (idx == 0) ? g_board : (idx == 1) ? g_unit : "NA";
-    S.resp[0] = 0xAE; S.resp[1] = 0x14; S.resp[2] = idx; memset(S.resp + 3, 0, 60); memcpy(S.resp + 3, s, strlen(s)); S.resp_len = 63; break; }
-  case 0xB4:    // connection/version state per slot: value 0x02 = controller connected, 0x01 = not
-    S.resp[0] = 0xB4; S.resp[1] = 0x01;
-    S.resp[2] = (slot == g_connSlot && !g_xbox && (millis() - g_connReplyMs < 500)) ? 0x02 : 0x01;
-    S.resp_len = 63; break;
-  case 0xAD:
-    g_pairing = (pln > 0 && pl[0] != 0); Serial.printf("# pairing %s\n", g_pairing ? "ON" : "off");
-    S.resp[0] = 0xAD; S.resp[1] = 0; S.resp_len = 63; break;
-  case 0xA2:                                   // write/clear THIS interface's slot
-    if (len >= 24 && pln >= 24) {
-      if (recEmpty(pl)) { S.used = false; memset(S.rec, 0, 24); }
-      else { memcpy(S.rec, pl, 24); S.used = true; }
-      g_dirty = true; Serial.printf("# slot %d %s\n", slot, recEmpty(pl) ? "cleared" : "bonded");
-    }
-    S.resp[0] = 0xA2; S.resp[1] = 0; S.resp_len = 63; break;
-  case 0xA3:                                   // read THIS interface's slot
-    S.resp[0] = 0xA3; S.resp[1] = 0x18; memset(S.resp + 2, 0, 24);
-    if (S.used) memcpy(S.resp + 2, S.rec, 24); S.resp_len = 63; break;
-  default:
-    S.resp[0] = cmd; S.resp[1] = len; if (pln) memcpy(S.resp + 2, pl, pln > 60 ? 60 : pln); S.resp_len = 63; break;
+    case 0x83:
+      S.resp[0] = 0x83; S.resp[1] = sizeof ATTR83; memcpy(S.resp + 2, ATTR83, sizeof ATTR83); S.resp_len = 63; break;
+    case 0xAE: {
+      uint8_t idx = pln > 0 ? pl[0] : 1; const char *s = (idx == 0) ? g_board : (idx == 1) ? g_unit : "NA";
+      S.resp[0] = 0xAE; S.resp[1] = 0x14; S.resp[2] = idx; memset(S.resp + 3, 0, 60); memcpy(S.resp + 3, s, strlen(s)); S.resp_len = 63; break; }
+    case 0xB4:    // connection/version state per slot: value 0x02 = controller connected, 0x01 = not
+      S.resp[0] = 0xB4; S.resp[1] = 0x01;
+      S.resp[2] = (slot == g_connSlot && !g_xbox && (millis() - g_connReplyMs < 500)) ? 0x02 : 0x01;
+      S.resp_len = 63; break;
+    case 0xAD:
+      g_pairing = (pln > 0 && pl[0] != 0); Serial.printf("# pairing %s\n", g_pairing ? "ON" : "off");
+      S.resp[0] = 0xAD; S.resp[1] = 0; S.resp_len = 63; break;
+    case 0xA2:                                   // write/clear THIS interface's slot
+      if (len >= 24 && pln >= 24) {
+        if (recEmpty(pl)) { S.used = false; memset(S.rec, 0, 24); }
+        else { memcpy(S.rec, pl, 24); S.used = true; }
+        g_dirty = true; Serial.printf("# slot %d %s\n", slot, recEmpty(pl) ? "cleared" : "bonded");
+      }
+      S.resp[0] = 0xA2; S.resp[1] = 0; S.resp_len = 63; break;
+    case 0xA3:                                   // read THIS interface's slot
+      S.resp[0] = 0xA3; S.resp[1] = 0x18; memset(S.resp + 2, 0, 24);
+      if (S.used) memcpy(S.resp + 2, S.rec, 24); S.resp_len = 63; break;
+    default:
+      S.resp[0] = cmd; S.resp[1] = len; if (pln) memcpy(S.resp + 2, pl, pln > 60 ? 60 : pln); S.resp_len = 63; break;
   }
 }
-
 static uint16_t handleGet(int slot, uint8_t rid, hid_report_type_t type, uint8_t *buf, uint16_t reqlen) {
   if (type != HID_REPORT_TYPE_FEATURE) return 0;
   Slot &S = g_slot[slot];
@@ -340,7 +335,7 @@ static uint16_t handleGet(int slot, uint8_t rid, hid_report_type_t type, uint8_t
 }
 
 // one callback pair per interface (the Adafruit core routes by interface to the matching object)
-#define SLOTCB(N)                                                       \
+#define SLOTCB(N) \
   static void setcb##N(uint8_t r, hid_report_type_t t, uint8_t const *b, uint16_t n) { handleSet(N, r, t, b, n); } \
   static uint16_t getcb##N(uint8_t r, hid_report_type_t t, uint8_t *bf, uint16_t rl) { return handleGet(N, r, t, bf, rl); }
 SLOTCB(0) SLOTCB(1) SLOTCB(2) SLOTCB(3)
@@ -349,7 +344,7 @@ typedef void (*setcb_t)(uint8_t, hid_report_type_t, uint8_t const *, uint16_t);
 static getcb_t GETCB[NSLOT] = { getcb0, getcb1, getcb2, getcb3 };
 static setcb_t SETCB[NSLOT] = { setcb0, setcb1, setcb2, setcb3 };
 
-// ===================== RF link (firmware-derived) =====================
+// ===================== PHASE 2: ESB radio (firmware-derived) =====================
 // Register-confirmed ESB config (RESOLVED.md): 2Mbit, 5-byte addr (BALEN=4), dynamic length
 // (LFLEN=8,S1LEN=3), 16-bit preamble, big-endian, whitening off, CRC16 poly 0x11021 init 0xFFFF
 // (address included). On-air = bitrev8(stored); RADIO BASE = byteswap32(bitrev8(stored)).
@@ -408,6 +403,8 @@ static uint8_t  g_connF3v=0xFF;   // last protocol version the controller report
 static uint16_t g_f1ps=0;   // last completed second's F1 rate (for the WebUSB status readout)
 static uint8_t  g_lastSeq=0; static uint32_t g_stNew=0; static uint16_t g_newps=0;  // genuine new-report rate (report 0x45 seq byte changes)
 static uint32_t g_stCrc=0, g_stNoRx=0;   // diagnostics: replies w/ bad CRC, and polls with no reply at all (timing vs RF-quality)
+static uint32_t g_chF1[3]={0,0,0};   // diagnostic: F1 replies per poll channel {sessCh,2,80}
+static uint8_t  g_chIdx=0, g_noRep=0; // (legacy hop counters; controller doesn't hop)
 static uint32_t g_lastPollUs=0;   // (g_pollUs declared in the config block near the top; 'U' or WebUSB to tune)
 static unsigned long g_lastSessBeacon=0;          // session keepalive beacon timer
 static uint32_t g_connRx   = 0;
@@ -422,6 +419,122 @@ static void rfSetAddr(const uint8_t b4[4], uint8_t prefix){
   NRF_RADIO->PREFIX0 = g_prefixRaw ? prefix : rfBitrev8(prefix);
   NRF_RADIO->TXADDRESS = 0; NRF_RADIO->RXADDRESSES = 1u<<0;
 }
+// Promiscuous raw capture (calibration only): preamble-match on 0x55 bytes, fixed-length grab, no CRC.
+// Catches any 2Mbit packet on a channel so we can read the controller's reconnect addr/prefix/framing.
+#define RAWCAP 48
+static bool g_rfRaw = false;
+static void rfRawStart(uint8_t ch){
+  NRF_RADIO->TASKS_DISABLE=1; RWAIT_DISABLED(); NRF_RADIO->EVENTS_DISABLED=0;
+  NRF_RADIO->MODE=(RADIO_MODE_MODE_Nrf_2Mbit<<RADIO_MODE_MODE_Pos);
+#if defined(RADIO_MODECNF0_RU_Fast)
+  NRF_RADIO->MODECNF0=(RADIO_MODECNF0_RU_Fast<<RADIO_MODECNF0_RU_Pos);
+#endif
+  NRF_RADIO->FREQUENCY=ch; NRF_RADIO->TXPOWER=(RADIO_TXPOWER_TXPOWER_0dBm<<RADIO_TXPOWER_TXPOWER_Pos);
+  NRF_RADIO->CRCCNF=0; NRF_RADIO->PCNF0=0;
+  NRF_RADIO->PCNF1=(RADIO_PCNF1_WHITEEN_Disabled<<RADIO_PCNF1_WHITEEN_Pos)
+                 |(RADIO_PCNF1_ENDIAN_Big<<RADIO_PCNF1_ENDIAN_Pos)
+                 |(2u<<RADIO_PCNF1_BALEN_Pos)|(RAWCAP<<RADIO_PCNF1_STATLEN_Pos)|(RAWCAP<<RADIO_PCNF1_MAXLEN_Pos);
+  NRF_RADIO->BASE0=0x55555555; NRF_RADIO->PREFIX0=0x00000055;
+  NRF_RADIO->TXADDRESS=0; NRF_RADIO->RXADDRESSES=1; NRF_RADIO->PACKETPTR=(uint32_t)rfrx;
+  NRF_RADIO->SHORTS=RADIO_SHORTS_READY_START_Msk|RADIO_SHORTS_END_START_Msk;
+  NRF_RADIO->EVENTS_END=0; NRF_RADIO->TASKS_RXEN=1;
+}
+// CAPTURE: listen for the CONTROLLER's transmission (test the inverted-direction hypothesis).
+// RX on "ibex"/BLE_1Mbit with CRC DISABLED (any address-matched packet logged, whitened or not;
+// the address is never whitened so a match still fires). Sweeps channels to find where it TXes.
+static bool g_rfCap = false;
+// CRC-VALIDATING capture (2Mbit, addr "ibex", CRC16 0x11021/0xFFFF). A CRC PASS pins PHY+addr+CRC+whiten.
+// Data looked bit-reversed (not whitened), so sweep whiten-OFF combos first: BALEN{3,4} x CRCCNF{incl,skip}
+// x ENDIAN{little,big}; then whiten-ON IV sweep as fallback. Cycle index g_capV.
+struct CapCfg{ uint8_t balen; uint16_t crccnf; uint8_t endianBig; uint8_t whiten; uint8_t iv; const char*tag; };
+static const CapCfg CAPC[] = {
+  {3,0x2,0,0,0,"BAL3 incl LE whOFF"},   {4,0x2,0,0,0,"BAL4 incl LE whOFF"},
+  {3,0x2,1,0,0,"BAL3 incl BE whOFF"},   {4,0x2,1,0,0,"BAL4 incl BE whOFF"},
+  {3,0x102,0,0,0,"BAL3 skip LE whOFF"}, {4,0x102,0,0,0,"BAL4 skip LE whOFF"},
+  {3,0x102,1,0,0,"BAL3 skip BE whOFF"}, {4,0x102,1,0,0,"BAL4 skip BE whOFF"},
+  {3,0x2,0,1,2,"BAL3 incl LE whIV2"},   {3,0x2,0,1,37,"BAL3 incl LE whIV37"},
+  {4,0x2,0,1,2,"BAL4 incl LE whIV2"},   {4,0x2,0,1,37,"BAL4 incl LE whIV37"},
+};
+static uint8_t g_capV=0; static uint32_t g_capPass=0;
+// CRC-VALIDATING de-whiten sweep: BLE-radio framing PCNF0=0x100108 (S0LEN1/LFLEN8) + WHITEEN + CRC16
+// 0x11021. Sweep DATAWHITEIV (0..127) x BALEN{3,4}. A CRC PASS de-whitens & de-frames -> clean payload + IV.
+// FRAMING SWEEP: ENDIAN=Big, addr "ibex", CRC16 0x11021/0xFFFF, sweep PCNF0 x CRCCNF. A CRC PASS on the
+// real puck's frame pins the exact framing (LFLEN/S1LEN/S0LEN) -> then copycat TX uses it.
+static const uint32_t CAPP0[]={0x00030006,0x00030008,0x00100108,0x00000008,0x00000006,0x00130006,0x00130008,0x00100008};
+// CRC configs: {CRCCNF, CRCPOLY, CRCINIT}
+static const uint32_t CAPCRC[][3]={{0x2,0x11021,0xFFFF},{0x102,0x11021,0xFFFF},{0x1,0x107,0xFF},{0x101,0x107,0xFF}};
+#define NCRC (sizeof CAPCRC/sizeof CAPCRC[0])
+// FRAMING SWEEP v2: ENDIAN=Big, S1LEN=3 (ESB PID+noack -> the 3-bit shift), STATIC length swept,
+// CRC16 0x11021 / CRC8 0x107. g_capV -> (pcnf0_idx, statlen, crc_idx).
+// Firmware-correct: ESB DPL (S0L0, LFLEN6or8, S1LEN3), BALEN4 (5-byte addr), CRC8/16 addr-included.
+// Sweep PCNF0{LFLEN6,8} x CRC{8,16} x BALEN{4,3} x ENDIAN{Big,Lit} = 16 combos.
+static const uint32_t CAPP0B[]={0x00030006,0x00030008};  // S1LEN3 + LFLEN6 / LFLEN8 (dynamic length)
+static const uint32_t CAPCRCB[][3]={{0x1,0x107,0xFF},{0x2,0x11021,0xFFFF}};
+#define NCRCB 2
+static void rfCapStart(uint8_t ch){
+  uint8_t ci=g_capV&1;
+  uint8_t balen=((g_capV>>1)&1)?3:4;            // BALEN 4 first
+  uint8_t endbig=((g_capV>>2)&1)^1;             // ENDIAN Big first
+  uint32_t p0=CAPP0B[(g_capV>>3)&1];
+  const uint32_t* cr=CAPCRCB[ci];
+  NRF_RADIO->TASKS_DISABLE=1; RWAIT_DISABLED(); NRF_RADIO->EVENTS_DISABLED=0;
+  NRF_RADIO->MODE=(RADIO_MODE_MODE_Ble_2Mbit<<RADIO_MODE_MODE_Pos);
+#if defined(RADIO_MODECNF0_RU_Fast)
+  NRF_RADIO->MODECNF0=(RADIO_MODECNF0_RU_Fast<<RADIO_MODECNF0_RU_Pos);
+#endif
+  NRF_RADIO->FREQUENCY=ch;
+  NRF_RADIO->PCNF0=p0;
+  NRF_RADIO->PCNF1=((uint32_t)endbig<<RADIO_PCNF1_ENDIAN_Pos)|((uint32_t)balen<<RADIO_PCNF1_BALEN_Pos)
+                  |(60u<<RADIO_PCNF1_MAXLEN_Pos);
+  NRF_RADIO->CRCCNF=cr[0]; NRF_RADIO->CRCPOLY=cr[1]; NRF_RADIO->CRCINIT=cr[2];
+  uint8_t b[4]; for(int i=0;i<4;i++) b[i]=rfBitrev8(g_rfBase[i]);
+  NRF_RADIO->BASE0=((uint32_t)b[0]<<24)|((uint32_t)b[1]<<16)|((uint32_t)b[2]<<8)|b[3];
+  NRF_RADIO->PREFIX0=rfBitrev8(g_rfPrefix); NRF_RADIO->TXADDRESS=0; NRF_RADIO->RXADDRESSES=1;
+  NRF_RADIO->PACKETPTR=(uint32_t)rfrx; memset(rfrx,0,8);
+  NRF_RADIO->SHORTS=RADIO_SHORTS_READY_START_Msk|RADIO_SHORTS_END_START_Msk;
+  NRF_RADIO->EVENTS_END=0; NRF_RADIO->TASKS_RXEN=1;
+}
+// REPLAY: capture one real-puck frame (raw, ENDIAN=Little) then re-transmit it VERBATIM (same bits,
+// addr, ch) to impersonate the puck bit-for-bit -- sidesteps unknown framing/CRC. Controller must be
+// bonded to the REAL puck (replayed frame carries real-puck uuids + its valid CRC).
+static uint8_t g_replay[48]; static uint8_t g_replayLen=0;
+static bool g_rfCapOne=false, g_rfReplay=false;
+static void rfCapPoll(){
+  if(!g_rfCap) return;
+  if(NRF_RADIO->EVENTS_END){ NRF_RADIO->EVENTS_END=0;
+    g_capPass++;
+    if(g_rfCapOne){ memcpy(g_replay,rfrx,sizeof g_replay); g_replayLen=32; g_rfCapOne=false; g_rfCap=false;
+      Serial.printf("# captured replay frame (%uB): ",g_replayLen);
+      for(int i=0;i<g_replayLen;i++)Serial.printf("%02X",g_replay[i]); Serial.println(); return; }
+    if(NRF_RADIO->CRCSTATUS&1){
+      uint8_t ci=g_capV&1; uint8_t balen=((g_capV>>1)&1)?3:4; uint8_t eb=((g_capV>>2)&1)^1;
+      uint32_t p0=CAPP0B[(g_capV>>3)&1];
+      Serial.printf("@@@ CRCOK PCNF0=%lX BALEN=%u ENDIAN=%s POLY=%lX: ",(unsigned long)p0,balen,
+        eb?"Big":"Lit",(unsigned long)CAPCRCB[ci][1]);
+      for(int i=0;i<28;i++) Serial.printf("%02X",rfrx[i]); Serial.println();
+    }
+  }
+}
+static void rfReplayOnce(){
+  if(!g_replayLen) return;
+  NRF_RADIO->TASKS_DISABLE=1; RWAIT_DISABLED(); NRF_RADIO->EVENTS_DISABLED=0;
+  NRF_RADIO->MODE=(RADIO_MODE_MODE_Ble_2Mbit<<RADIO_MODE_MODE_Pos);
+#if defined(RADIO_MODECNF0_RU_Fast)
+  NRF_RADIO->MODECNF0=(RADIO_MODECNF0_RU_Fast<<RADIO_MODECNF0_RU_Pos);
+#endif
+  NRF_RADIO->FREQUENCY=2;                                          // ch2
+  NRF_RADIO->PCNF0=0;                                              // static, ENDIAN=Little -> reproduce on-air bits
+  NRF_RADIO->PCNF1=(3u<<RADIO_PCNF1_BALEN_Pos)|((uint32_t)g_replayLen<<RADIO_PCNF1_STATLEN_Pos)|((uint32_t)g_replayLen<<RADIO_PCNF1_MAXLEN_Pos);
+  NRF_RADIO->CRCCNF=0;                                            // CRC already inside the captured bytes
+  uint8_t b[4]; for(int i=0;i<4;i++) b[i]=rfBitrev8(g_rfBase[i]);
+  NRF_RADIO->BASE0=((uint32_t)b[0]<<24)|((uint32_t)b[1]<<16)|((uint32_t)b[2]<<8)|b[3];
+  NRF_RADIO->PREFIX0=rfBitrev8(g_rfPrefix); NRF_RADIO->TXADDRESS=0;
+  NRF_RADIO->PACKETPTR=(uint32_t)g_replay;
+  NRF_RADIO->SHORTS=RADIO_SHORTS_READY_START_Msk|RADIO_SHORTS_END_DISABLE_Msk;
+  NRF_RADIO->EVENTS_DISABLED=0; NRF_RADIO->TASKS_TXEN=1;
+  RWAIT_DISABLED(); NRF_RADIO->EVENTS_DISABLED=0;
+  NRF_RADIO->TASKS_DISABLE=1; RWAIT_DISABLED(); NRF_RADIO->EVENTS_DISABLED=0;
+}
 static void rfConfig(uint8_t ch){
   NRF_RADIO->TASKS_DISABLE = 1; RWAIT_DISABLED(); NRF_RADIO->EVENTS_DISABLED = 0;
   NRF_RADIO->MODE = ((uint32_t)g_mode << RADIO_MODE_MODE_Pos);   // Ble_1Mbit (tunable 'M')
@@ -432,10 +545,10 @@ static void rfConfig(uint8_t ch){
 #endif
   NRF_RADIO->PCNF0 = g_pcnf0;       // static length (tunable '0'); g_pcnf1=0 -> build from g_statlen/g_balen
   NRF_RADIO->PCNF1 = g_pcnf1 ? g_pcnf1 :
-    ((1u<<RADIO_PCNF1_ENDIAN_Pos)              // ENDIAN=Big (puck transmits MSB-first)
-     |((uint32_t)g_balen<<RADIO_PCNF1_BALEN_Pos)
-     |((uint32_t)g_statlen<<RADIO_PCNF1_STATLEN_Pos)
-     |((uint32_t)g_statlen<<RADIO_PCNF1_MAXLEN_Pos));   // WHITEEN=0
+        ((1u<<RADIO_PCNF1_ENDIAN_Pos)              // ENDIAN=Big (puck transmits MSB-first)
+        |((uint32_t)g_balen<<RADIO_PCNF1_BALEN_Pos)
+        |((uint32_t)g_statlen<<RADIO_PCNF1_STATLEN_Pos)
+        |((uint32_t)g_statlen<<RADIO_PCNF1_MAXLEN_Pos));   // WHITEEN=0
   NRF_RADIO->CRCCNF = g_crccnf;     // CRC16, address included
   NRF_RADIO->CRCPOLY = g_crcpoly; NRF_RADIO->CRCINIT = g_crcinit;
   NRF_RADIO->DATAWHITEIV = g_whiteiv;
@@ -451,6 +564,20 @@ static void rfListenStart(){
                 g_rfCh, g_rfBase[0],g_rfBase[1],g_rfBase[2],g_rfBase[3], g_rfPrefix);
 }
 static void rfPoll(){
+  if (g_rfRaw){
+    if (NRF_RADIO->EVENTS_END){
+      NRF_RADIO->EVENTS_END = 0;
+      // filter noise: require some non-0x55/0xAA/0x00 structure
+      int nz=0; for(int i=0;i<RAWCAP;i++){uint8_t b=rfrx[i]; if(b&&b!=0x55&&b!=0xAA&&b!=0xFF)nz++;}
+      if (nz>=6){
+        g_rfRxCount++;
+        Serial.printf("RAW#%lu ch%u: ", (unsigned long)g_rfRxCount, g_rfCh);
+        for (int i=0;i<RAWCAP;i++) Serial.printf("%02X", rfrx[i]);
+        Serial.println();
+      }
+    }
+    return;
+  }
   if (!g_rfListen) return;
   if (NRF_RADIO->EVENTS_END){
     NRF_RADIO->EVENTS_END = 0;
@@ -470,8 +597,32 @@ static bool    g_rfBeacon = false;
 static uint8_t g_seq = 0, g_plen = 0x18, g_s1incl = 0;
 static unsigned long g_lastBeacon = 0;
 static unsigned long g_lastDisc = 0;   // last discovery beacon (ch2) time
+static bool    g_rfSweep = false;
 static bool    g_rfHost = true;   // auto-start host beacon on boot (resumes puck role after a USB replug)
 static unsigned long g_lastHop = 0;
+
+// AUTO-SWEEP: cycle candidate radio configs while beaconing, so ONE controller search window
+// (a few seconds) covers the whole space. S0LEN=1 / CRC16 0x11021 / addr "ibex" held fixed
+// (firmware-confirmed); we sweep the residual unknowns: PHY (1M/2M), whitening (off/IV), CRC-addr.
+// Hold MODE=Ble_1Mbit, PCNF0=0x100108 (S0LEN=1), CRC16 0x11021 cnf2; sweep the UNTESTED dims:
+// BALEN (3 vs 4 = 4- vs 5-byte addr), whitening (off / iv37), prefix (bitrev vs raw), + one 2M.
+struct RfCfg { uint8_t mode; uint32_t pcnf0, pcnf1; uint8_t whiteiv; uint16_t crccnf; bool prefRaw; const char* tag; };
+static const RfCfg SWEEP[] = {
+  {RADIO_MODE_MODE_Ble_1Mbit, 0x00100108, 0x02040040, 37, 0x2, false, "1M BALEN4 whiv37 pfxRev"},
+  {RADIO_MODE_MODE_Ble_1Mbit, 0x00100108, 0x00040040, 0,  0x2, false, "1M BALEN4 whOFF pfxRev"},
+  {RADIO_MODE_MODE_Ble_1Mbit, 0x00100108, 0x02040040, 37, 0x2, true,  "1M BALEN4 whiv37 pfxRAW"},
+  {RADIO_MODE_MODE_Ble_1Mbit, 0x00100108, 0x00040040, 0,  0x2, true,  "1M BALEN4 whOFF pfxRAW"},
+  {RADIO_MODE_MODE_Ble_1Mbit, 0x00100108, 0x02030040, 37, 0x2, false, "1M BALEN3 whiv37 pfxRev"},
+  {RADIO_MODE_MODE_Ble_1Mbit, 0x00100108, 0x00030040, 0,  0x2, true,  "1M BALEN3 whOFF pfxRAW"},
+  {RADIO_MODE_MODE_Ble_2Mbit, 0x00100108, 0x02040040, 37, 0x2, false, "2M BALEN4 whiv37 pfxRev"},
+  {RADIO_MODE_MODE_Ble_2Mbit, 0x00100108, 0x00040040, 0,  0x2, true,  "2M BALEN4 whOFF pfxRAW"},
+};
+static bool g_rfAuto = false; static uint8_t g_cfgIdx = 0; static unsigned long g_lastCfg = 0;
+static void applyCfg(uint8_t i){
+  const RfCfg &c = SWEEP[i];
+  g_mode=c.mode; g_pcnf0=c.pcnf0; g_pcnf1=c.pcnf1; g_whiteiv=c.whiteiv; g_crccnf=c.crccnf; g_prefixRaw=c.prefRaw;
+  Serial.printf("# cfg[%u] %s\n", i, c.tag);
+}
 
 // HOST FRAME the bonded controller waits for (IBEX FUN_00019000 verify: b[0]=0x12,b[5]=0xE1,
 // b[6..10]=proteus_uuid, b[10..14]=ibex_uuid). Built like PROTEUS FUN_00027e9a. Sent on the shared
@@ -504,8 +655,8 @@ static void rfHostFrameOnce(int slot){
   if (NRF_RADIO->EVENTS_END){ NRF_RADIO->EVENTS_END=0;   // ANY reception = controller answered our frame
     g_rfRxCount++; bool crcok=NRF_RADIO->CRCSTATUS&1; uint8_t len=rfrx[0];
     if (Serial.availableForWrite()>90){                  // non-blocking: don't stall the loop on CDC backpressure
-      Serial.printf("*** RESP#%lu ch%u crc%d rxmatch%lu len%u: ",(unsigned long)g_rfRxCount,
-                    g_rfCh,crcok,(unsigned long)NRF_RADIO->RXMATCH,len);
+      Serial.printf("*** RESP#%lu cfg[%u] ch%u crc%d rxmatch%lu len%u: ",(unsigned long)g_rfRxCount,
+                    g_cfgIdx,g_rfCh,crcok,(unsigned long)NRF_RADIO->RXMATCH,len);
       for(uint8_t i=0;i<(len<40?len+2:40);i++)Serial.printf("%02X ",rfrx[i]); Serial.println(); } }
   NRF_RADIO->TASKS_DISABLE=1; RWAIT_DISABLED(); NRF_RADIO->EVENTS_DISABLED=0;
 }
@@ -519,7 +670,7 @@ static void rfHopTo(uint8_t newCh){
   for(int k=0;k<6;k++){ rfHostFrameOnce(g_connSlot); delayMicroseconds(700); }
   g_rfCh=savedRfCh;                          // poll + session beacon now run on g_sessCh=newCh
 }
-// CONNECTED MODE: OpenPuck is the PTX/master. It already chose the session base/prefix/channel
+// CONNECTED MODE (Phase 2b): copycat IS the PTX/master. It already CHOSE the session base/prefix/channel
 // (advertised in the host frame the controller connected on), so no discovery/re-sync is needed. After
 // connect: send E7 (proto-version 00 01), send E4 (channel map {ch,2,80}), then loop E3 input-poll (+E2
 // keepalive periodically) hopping the map; RX the controller's reply each cycle (0xF1 = full input report
@@ -576,8 +727,8 @@ static void smoothPad(uint8_t* rep){     // rep = report 0x45; smooth LPad(@18/2
 // button code (g_back[], g_abSwap targets) -> XInput bit. 0=none 1=A 2=B 3=X 4=Y 5=LB 6=RB 7=L3 8=R3 9=Back 10=Start 11=Guide
 static uint16_t codeToXB(uint8_t c){
   switch(c){ case 1:return XB_A; case 2:return XB_B; case 3:return XB_X; case 4:return XB_Y;
-  case 5:return XB_LB; case 6:return XB_RB; case 7:return XB_L3; case 8:return XB_R3;
-  case 9:return XB_BACK; case 10:return XB_START; case 11:return XB_GUIDE; default:return 0; }
+    case 5:return XB_LB; case 6:return XB_RB; case 7:return XB_L3; case 8:return XB_R3;
+    case 9:return XB_BACK; case 10:return XB_START; case 11:return XB_GUIDE; default:return 0; }
 }
 static void rfXboxGamepad(const uint8_t* r){
   uint32_t b=btnsOf(r);
@@ -594,52 +745,52 @@ static void rfXboxGamepad(const uint8_t* r){
   if(b&TB_L5)btn|=codeToXB(g_back[2]); if(b&TB_R5)btn|=codeToXB(g_back[3]);
   uint8_t lt=u16off(r,4)>>8, rt=u16off(r,6)>>8;     // triggers u16 -> u8
   xinputSend(btn, lt, rt, (int16_t)s16off(r,8), (int16_t)s16off(r,10),   // L stick X/Y
-             (int16_t)s16off(r,12), (int16_t)s16off(r,14)); // R stick X/Y
+                          (int16_t)s16off(r,12), (int16_t)s16off(r,14)); // R stick X/Y
 }
-// Right-pad -> mouse, modeled on the real puck's lizard mouse: pad deltas feed a VELOCITY that is emitted
-// each report and decays with friction. This (a) smooths the stale-repeat bursts, (b) gives momentum/flick
-// (a fast swipe injects high velocity -> cursor keeps sliding after lift), (c) sub-pixel remainder carry so
-// slow drags still move. Tunable live: M<div>=sensitivity (lower=faster), F<pct>=friction% (higher=more glide).
-// (g_mDiv, g_mFric declared at top with the persisted config)
+// Right pad -> mouse, riding ALONGSIDE the XInput gamepad on a second HID-mouse interface. Same glide model
+// as Lizard's right pad (velocity injected from pad deltas, friction decay, sub-pixel carry). This is purely
+// a USB-side translation of the received 0x45 report — it touches NOTHING about the RF poll or relay, so the
+// controller behaves exactly as it does for the bare gamepad. RPad click = left button, LPad click = right.
+// (The earlier "mouse vs controller race" was actually the CDC composite, now fixed: Xbox drops CDC/WebUSB,
+//  so the only interfaces are XInput (MI_00) + mouse (MI_01).)
 static void rfXboxMouse(const uint8_t* r){
   uint32_t b=btnsOf(r);
-  static int px=0,py=0; static bool pt=false; static float vx=0,vy=0,rmx=0,rmy=0; static uint8_t pmb=0;
-  bool touch=b&TB_RPADT; int rx=s16off(r,22), ry=s16off(r,24);
-  if(touch){ if(pt){ vx+=(rx-px); vy+=(ry-py); } px=rx; py=ry; }   // inject genuine pad move into velocity
-  pt=touch;
-  float mxf = vx/(float)g_mDiv + rmx, myf = -(vy/(float)g_mDiv) + rmy;   // Y inverted for screen coords
-  int dx=(int)mxf, dy=(int)myf; rmx=mxf-dx; rmy=myf-dy;                  // fractional carry (sub-pixel)
+  static int prx=0,pry=0; static bool prt=false; static float vx=0,vy=0,rmx=0,rmy=0; static uint8_t pmb=0;
+  bool rtouch=b&TB_RPADT; int rx=s16off(r,22), ry=s16off(r,24);
+  if(rtouch){ if(prt){ vx+=(rx-prx); vy+=(ry-pry); } prx=rx; pry=ry; } prt=rtouch;
+  float mxf=vx/(float)(g_mDiv*10)+rmx, myf=-(vy/(float)(g_mDiv*10))+rmy;   // Y inverted for screen coords
+  int dx=(int)mxf, dy=(int)myf; rmx=mxf-dx; rmy=myf-dy;                    // sub-pixel carry
   if(dx>127)dx=127; if(dx<-127)dx=-127; if(dy>127)dy=127; if(dy<-127)dy=-127;
-  float f=g_mFric/100.0f; vx*=f; vy*=f; if(vx>-1&&vx<1)vx=0; if(vy>-1&&vy<1)vy=0;  // friction (glide/decay)
-  uint8_t mb=((b&TB_RPADC)?1:0)|((b&TB_LPADC)?2:0);  // RPad click=left, LPad click=right
+  float f=g_mFric/100.0f; vx*=f; vy*=f; if(vx>-1&&vx<1)vx=0; if(vy>-1&&vy<1)vy=0;   // friction = glide/decay
+  uint8_t mb=((b&TB_RPADC)?1:0)|((b&TB_LPADC)?2:0);  // RPad click = left, LPad click = right
   if(dx||dy||mb!=pmb){ pmb=mb;
     hid_mouse_report_t m; m.buttons=mb; m.x=(int8_t)dx; m.y=(int8_t)dy; m.wheel=0; m.pan=0;
     if(g_mouse.ready()) g_mouse.sendReport(0,&m,sizeof m);
   }
 }
-// ===================== LIZARD mode (mode 3) — desktop keyboard + mouse =====================
-// The controller's native "lizard" desktop behavior, reproduced on the OpenPuck side so the controller is a
-// driverless keyboard+mouse when Steam isn't running. Canonical Valve Steam Controller firmware map (SC1,
-// the documented reference; SC2 presumed-similar): right pad -> mouse (trackball glide), left pad -> scroll
-// wheel + middle-click on press, R-trigger / R-pad-click -> left mouse, L-trigger -> right mouse;
-// A=Enter B=Esc X=PgUp Y=PgDn, D-pad & left-stick -> arrow keys, LB=LeftCtrl RB=LeftAlt, Back/View=Tab,
-// Start/Menu=Esc, Steam=none. The mouse reuses the SAME velocity+friction+sub-pixel GLIDE model as Xbox mode
-// (g_mDiv = sensitivity divisor, g_mFric = friction% — both live-tunable), which is the "custom smoothing
-// and gliding" the real lizard mouse has (cursor coasts after lift, smooth sub-pixel slow drags).
+// ===================== Seamless LIZARD (Steam mode, when Steam is closed) — desktop keyboard + mouse =====
+// The controller's native "lizard" desktop behavior, reproduced on the copycat side so the device is a
+// driverless keyboard+mouse when Steam isn't running. Driven from the Steam path (report 0x45 -> mouse 0x40 +
+// keyboard 0x41 on the puck interface) and parameterized by the target HID device + report IDs. Canonical
+// Valve Steam Controller firmware map (SC1, the documented reference; SC2 presumed-similar): right pad ->
+// mouse (trackball glide), left pad -> scroll wheel + middle-click on press, R-trigger / R-pad-click -> left
+// mouse, L-trigger -> right mouse; A=Enter B=Esc X=PgUp Y=PgDn, D-pad & left-stick -> arrow keys, LB=LeftCtrl
+// RB=LeftAlt, Back/View=Tab, Start/Menu=Esc, Steam=none. The mouse reuses the SAME velocity+friction+sub-pixel
+// GLIDE model as Xbox mode (g_mDiv = sensitivity divisor, g_mFric = friction% — both live-tunable).
 static void rfLizard(const uint8_t* r, Adafruit_USBD_HID* mdev, Adafruit_USBD_HID* kdev, uint8_t mrid, uint8_t krid){
   uint32_t b=btnsOf(r);
   // --- right pad -> mouse motion with glide (mirrors rfXboxMouse) ---
   static int prx=0,pry=0; static bool prt=false; static float vx=0,vy=0,rmx=0,rmy=0;
   bool rtouch=b&TB_RPADT; int rx=s16off(r,22), ry=s16off(r,24);
   if(rtouch){ if(prt){ vx+=(rx-prx); vy+=(ry-pry); } prx=rx; pry=ry; } prt=rtouch;
-  float mxf=vx/(float)g_lizDiv+rmx, myf=-(vy/(float)g_lizDiv)+rmy;   // Y inverted for screen coords; g_lizDiv = lizard sensitivity (separate from Xbox aim)
+  float mxf=vx/(float)(g_mDiv*10)+rmx, myf=-(vy/(float)(g_mDiv*10))+rmy;   // Y inverted; *10 = desktop-cursor sensitivity (g_mDiv 64 -> eff 640). Lower g_mDiv via WebUI slider = faster.
   int dx=(int)mxf, dy=(int)myf; rmx=mxf-dx; rmy=myf-dy;          // sub-pixel carry
   if(dx>127)dx=127; if(dx<-127)dx=-127; if(dy>127)dy=127; if(dy<-127)dy=-127;
-  float f=g_lizFric/100.0f; vx*=f; vy*=f; if(vx>-1&&vx<1)vx=0; if(vy>-1&&vy<1)vy=0;   // friction = glide/decay (lizard has its own, crisper than Xbox)
+  float f=g_mFric/100.0f; vx*=f; vy*=f; if(vx>-1&&vx<1)vx=0; if(vy>-1&&vy<1)vy=0;   // friction = glide/decay
   // --- left pad -> vertical scroll wheel (no momentum; only while touching, coarse) ---
   static int ply=0; static bool plt=false; static float sacc=0;
   bool ltouch=b&TB_LPADT; int ly=s16off(r,18);
-  if(ltouch){ if(plt){ sacc += (ly-ply)/(float)(g_lizDiv*8); } ply=ly; } else sacc=0; plt=ltouch;
+  if(ltouch){ if(plt){ sacc += (ly-ply)/(float)(g_mDiv*24); } ply=ly; } else sacc=0; plt=ltouch;
   int dw=(int)sacc; sacc-=dw; if(dw>15)dw=15; if(dw<-15)dw=-15;   // finger up = wheel up (positive)
   // --- mouse buttons: left=R-pad-click|R-trigger, right=L-trigger, middle=L-pad-click ---
   uint8_t rtrig=u16off(r,6)>>8, ltrig=u16off(r,4)>>8;
@@ -656,7 +807,7 @@ static void rfLizard(const uint8_t* r, Adafruit_USBD_HID* mdev, Adafruit_USBD_HI
   uint8_t mod=0, kc[6]={0,0,0,0,0,0}, nk=0;
   if(b&TB_LB) mod|=KEYBOARD_MODIFIER_LEFTCTRL;
   if(b&TB_RB) mod|=KEYBOARD_MODIFIER_LEFTALT;
-#define LZK(cond,code) do{ if((cond)&&nk<6) kc[nk++]=(code); }while(0)
+  #define LZK(cond,code) do{ if((cond)&&nk<6) kc[nk++]=(code); }while(0)
   LZK(b&TB_A,    HID_KEY_ENTER);
   LZK(b&TB_B,    HID_KEY_ESCAPE);
   LZK(b&TB_X,    HID_KEY_PAGE_UP);
@@ -668,7 +819,7 @@ static void rfLizard(const uint8_t* r, Adafruit_USBD_HID* mdev, Adafruit_USBD_HI
   LZK((b&TB_DDN)||sy<-12000, HID_KEY_ARROW_DOWN);
   LZK((b&TB_DLF)||sx<-12000, HID_KEY_ARROW_LEFT);
   LZK((b&TB_DRT)||sx> 12000, HID_KEY_ARROW_RIGHT);
-#undef LZK
+  #undef LZK
   static uint8_t pmod=0, pkc[6]={0,0,0,0,0,0};
   bool chg=(mod!=pmod); for(int i=0;i<6;i++) if(kc[i]!=pkc[i]) chg=true;
   if(chg){ pmod=mod; for(int i=0;i<6;i++) pkc[i]=kc[i];
@@ -701,6 +852,12 @@ static inline uint8_t swStick(int16_t v,bool invert){   // int16 (center 0) -> u
   int32_t a = 0x80 + (invert ? -((int32_t)v>>8) : ((int32_t)v>>8));
   if(a<0)a=0; if(a>255)a=255; return (uint8_t)a;
 }
+// back-paddle code (g_back[]) -> Switch button bit. 0=none 1=A 2=B 3=X 4=Y 5=LB 6=RB 7=L3 8=R3 9=Back(Minus) 10=Start(Plus) 11=Guide(Home)
+static uint16_t codeToSwitch(uint8_t c, uint16_t fA,uint16_t fB,uint16_t fX,uint16_t fY){
+  switch(c){ case 1:return fA; case 2:return fB; case 3:return fX; case 4:return fY;
+    case 5:return 0x10; case 6:return 0x20; case 7:return 0x400; case 8:return 0x800;
+    case 9:return 0x100; case 10:return 0x200; case 11:return 0x1000; default:return 0; }
+}
 static void switchBuildHoripad(uint8_t out[8]){
   uint32_t b=g_swBtns; uint16_t btn=0;
   // face buttons with optional A/B + X/Y swap (Nintendo physical-vs-label layout)
@@ -711,6 +868,9 @@ static void switchBuildHoripad(uint8_t out[8]){
   if(b&TB_VIEW)btn|=0x100; if(b&TB_MENU)btn|=0x200;           // Minus, Plus
   if(b&TB_L3)btn|=0x400; if(b&TB_R3)btn|=0x800;               // LClick, RClick
   if(b&TB_STEAM)btn|=0x1000;                                  // Home
+  // back paddles -> configurable mapping (same g_back[] as Xbox: default L4->LB R4->RB L5->L3 R5->R3)
+  if(b&TB_L4)btn|=codeToSwitch(g_back[0],fA,fB,fX,fY); if(b&TB_R4)btn|=codeToSwitch(g_back[1],fA,fB,fX,fY);
+  if(b&TB_L5)btn|=codeToSwitch(g_back[2],fA,fB,fX,fY); if(b&TB_R5)btn|=codeToSwitch(g_back[3],fA,fB,fX,fY);
   bool u=b&TB_DUP,d=b&TB_DDN,l=b&TB_DLF,r=b&TB_DRT;           // hat: 0=N..7=NW, 8=neutral
   uint8_t hat=8;
   if(u&&r)hat=1; else if(r&&d)hat=3; else if(d&&l)hat=5; else if(l&&u)hat=7;
@@ -775,9 +935,9 @@ static uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t* payload, uint8_t 
       bool isF1=(rtype==0xF1);
       if(isF1){
         g_connF1++;
-        uint8_t idx=3, end=rxlen+2;                     // walk ALL type6 TLVs (= HID report 0x45)
-        const uint8_t* lastRep=nullptr; uint8_t lastTlen=0;  // the controller PACKS several queued reports per F1;
-        while(idx+1<end){                               // draining all of them (not just the first) is what keeps
+        int idx=3, end=rxlen+2;                         // walk ALL type6 TLVs (= HID report 0x45). idx is INT, not
+        const uint8_t* lastRep=nullptr; uint8_t lastTlen=0;  // uint8_t: a tlen of 0xFE would make idx+=tlen+2 wrap
+        while(idx+1<end){                               // mod-256 back to itself -> infinite loop -> USB hang/"crash".
           uint8_t tlen=rfrx[idx], ttype=rfrx[idx+1];    // pace with the real puck — taking only [0] halved our rate.
           if(tlen==0) break;
           if(ttype==6 && tlen>=2 && rfrx[idx+2]==0x45){
@@ -788,15 +948,14 @@ static uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t* payload, uint8_t 
             g_swBtns=bb; g_swLX=(int16_t)s16off(rep,8); g_swLY=(int16_t)s16off(rep,10);
             g_swRX=(int16_t)s16off(rep,12); g_swRY=(int16_t)s16off(rep,14);
             if(g_usbMode==2){                           // SWITCH: streamed from loop() (swStream); nothing to send here
-            } else if(g_usbMode==3){                    // LIZARD: translate report 0x45 -> keyboard + mouse (forced)
-              rfLizard(rep, &g_mouse, &g_keyboard, 0, 0);
-            } else if(g_xbox){                          // XBOX: standard gamepad + right-pad mouse
+            } else if(g_xbox){                          // XBOX: standard gamepad + right-pad mouse (2nd interface)
               rfXboxGamepad(rep); rfXboxMouse(rep);
             } else if(g_connSlot>=0 && g_connSlot<NSLOT){  // STEAM (puck interface)
-              // Auto-lizard: while Steam's 0x87 heartbeat is alive -> forward gamepad report 0x45; once it
-              // stops (Steam closed) -> emit lizard mouse(0x40)+keyboard(0x41) on the same interface, like the puck.
+              // Seamless lizard, exactly like the real puck: while Steam's 0x87 heartbeat is alive -> forward
+              // the gamepad report 0x45; once it stops (Steam closed) -> drive mouse(0x40)+keyboard(0x41) on the
+              // SAME puck interface (the cloned descriptor exposes both). Pure USB-side switch — RF/relay unchanged.
               bool steamAlive = g_steamAliveMs && (millis()-g_steamAliveMs < LIZARD_WD_MS);
-              if(!steamAlive){
+              if(g_autoLizard && !steamAlive){
                 rfLizard(rep, &hid[g_connSlot], &hid[g_connSlot], 0x40, 0x41);
               } else {
                 uint8_t blen=tlen-1; if(blen>45)blen=45;  // body after the 0x45 id byte
@@ -815,7 +974,7 @@ static uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t* payload, uint8_t 
         // garbled/misaligned report must not trigger saveMode+reset (that looked like a crash under heavy input).
         { static uint8_t chWant=0xFF, chCnt=0;
           const uint32_t BACK4=TB_R4|TB_L4|TB_R5|TB_L5; uint8_t want=0xFF;
-          if((g_swBtns&BACK4)==BACK4){ if(g_swBtns&TB_A)want=0; else if(g_swBtns&TB_X)want=1; else if(g_swBtns&TB_Y)want=2; else if(g_swBtns&TB_B)want=3; }  // back4 + A=Steam X=Xbox Y=Switch B=Lizard
+          if((g_swBtns&BACK4)==BACK4){ if(g_swBtns&TB_A)want=0; else if(g_swBtns&TB_X)want=1; else if(g_swBtns&TB_Y)want=2; }  // back4 + A=Steam X=Xbox Y=Switch (lizard is automatic in Steam mode now)
           if(want!=0xFF && want==chWant){ if(++chCnt>=12 && want!=g_usbMode){ saveMode(want); delay(40); NVIC_SystemReset(); } }
           else { chWant=want; chCnt=(want!=0xFF)?1:0; }
         }
@@ -861,11 +1020,53 @@ static void rfConnStep(){
     } else {
       uint8_t p[5]={0xE3,0x02,0x01,0x45,g_getParam}; // E3 + TLV [len=02][subtype=01 GET][id=0x45][param]
       uint8_t s1 = (g_e3mode==1) ? (uint8_t)((((g_e3pid++)&3)<<1)|1)   // cycle PID (S1 1,3,5,7), NO_ACK=1
-        : (g_e3mode==2) ? (uint8_t)(((g_e3pid++)&3)<<1)       // cycle PID (S1 0,2,4,6), NO_ACK=0
-        : 0x07;                                               // fixed (current default; matches captured puck poll)
-      rfConnTx(ch,s1,p,5);
+                 : (g_e3mode==2) ? (uint8_t)(((g_e3pid++)&3)<<1)       // cycle PID (S1 0,2,4,6), NO_ACK=0
+                 : 0x07;                                               // fixed (current default; matches captured puck poll)
+      uint8_t rx=rfConnTx(ch,s1,p,5);
+      if(rx) g_chF1[0]++;
     }
     g_connPoll++;
+  }
+}
+// SESSION SNIFFER (Phase 2b capture): phase 0 RX the real puck's host frame on "ibex"/ch2 (CRC16
+// config) to learn the random session base/prefix/channel; phase 1 RX that session address on the
+// hop channels {hostch,2,80} to capture the live connected exchange (0xE3 poll + 0xF1 input reply).
+static bool g_sniff=false; static uint8_t g_sniffPh=0; static uint32_t g_sniffN=0;
+static uint8_t g_sbase[4]={0,0,0,0}, g_sprefix=0; static uint8_t g_schan[3]={78,2,80}; static uint8_t g_schi=0;
+static unsigned long g_sniffHop=0;
+static uint8_t g_sniffPark=0;   // phase-1: 0=park on learned primary g_schan[0]; else park on this literal channel ('g<n>')
+static void rfSniffStart(){
+  uint8_t ch = (g_sniffPh==0)?2:(g_sniffPark?g_sniffPark:g_schan[0]);   // PARK (no hop): primary carries the traffic
+  const uint8_t* base = (g_sniffPh==0)?g_rfBase:g_sbase;
+  uint8_t pfx = (g_sniffPh==0)?g_rfPrefix:g_sprefix;
+  rfConfig(ch);                         // Ble_2Mbit, PCNF0=0x30008, ENDIAN big, BALEN4, CRC16 0x11021
+  uint8_t b[4]; for(int i=0;i<4;i++) b[i]=rfBitrev8(base[i]);
+  NRF_RADIO->BASE0=((uint32_t)b[0]<<24)|((uint32_t)b[1]<<16)|((uint32_t)b[2]<<8)|b[3];
+  NRF_RADIO->PREFIX0=rfBitrev8(pfx); NRF_RADIO->TXADDRESS=0; NRF_RADIO->RXADDRESSES=1;
+  NRF_RADIO->PACKETPTR=(uint32_t)rfrx; memset(rfrx,0,4);
+  NRF_RADIO->SHORTS=RADIO_SHORTS_READY_START_Msk|RADIO_SHORTS_END_START_Msk;
+  NRF_RADIO->EVENTS_END=0; NRF_RADIO->TASKS_RXEN=1;
+}
+static void rfSniffPoll(){
+  if(!g_sniff) return;
+  if(NRF_RADIO->EVENTS_END){ NRF_RADIO->EVENTS_END=0;
+    bool crcok=NRF_RADIO->CRCSTATUS&1; uint8_t len=rfrx[0];
+    if(crcok && len && len<40){
+      g_sniffN++;
+      if(g_sniffPh==0 && rfrx[2]==0xE1){           // host frame -> learn session params + DUMP FULL (app-data may ride here)
+        memcpy(g_sbase,rfrx+15,4); g_sprefix=rfrx[19]; g_schan[0]=rfrx[11];
+        Serial.printf("# HOSTFRAME ch=%u sbase=%02X%02X%02X%02X prefix=%02X len%u FULL: ",
+          rfrx[11],g_sbase[0],g_sbase[1],g_sbase[2],g_sbase[3],g_sprefix,len);
+        { uint8_t dn=(len+2<64)?len+2:64; for(uint8_t i=0;i<dn;i++)Serial.printf("%02X",rfrx[i]); } Serial.println();
+        g_sniffPh=1; g_schi=0; rfSniffStart();
+      } else if(g_sniffPh==1){
+        uint8_t ty=rfrx[2];                          // 0xF1=input, 0x12/0xE1/0xE4=puck host-frame w/ app-data
+        const char* tag = (ty==0xF1)?"<<<INPUT":(ty==0x12||ty==0xE1||ty==0xE4)?">>>HOSTFR":"  pkt";
+        Serial.printf("%s SNIFF#%lu ch%u len%u: ",tag,(unsigned long)g_sniffN,g_schan[g_schi],len);
+        uint8_t dn=(len+2<64)?len+2:64;              // FULL frame (app-data TLVs sit near the end)
+        for(uint8_t i=0;i<dn;i++)Serial.printf("%02X",rfrx[i]); Serial.println();
+      }
+    }
   }
 }
 // SCAN-THEN-RESPOND (dongle role): listen on ch2/91A2A793 for the controller's advertisement,
@@ -937,7 +1138,7 @@ static void rfBeaconOnce(){
 }
 
 // ===================== WebUSB config channel =====================
-// Browser panel <-> firmware, binary framed.
+// Browser panel (copycat_config.html) <-> firmware, binary framed.
 //   host->dev:  0x01                  GET  -> reply status blob
 //               0x02 <field> <value>  SET one byte field (1=mDiv 2=mFric 3=padSmooth 4=abSwap 5..8=back[0..3] 9=pollU100 10=e7b 11=relayOp 12=relaySub 13=testHaptic)
 //               0x03 <mode>           switch USB mode (0=steam 1=xbox 2=switch): persist + reboot
@@ -979,31 +1180,31 @@ static void webusbPoll(){
         uint8_t f=buf[1], v=buf[2];
         bool persist=true;   // most fields persist; the rate knobs are session-only (locked default on reboot)
         switch(f){
-        case 1: g_mDiv = v<4?4:v; break;
-        case 2: g_mFric = v>99?99:v; break;
-        case 3: g_padSmooth = v<5?5:(v>100?100:v); break;
-        case 4: g_abSwap = v?1:0; break;
-        case 5: case 6: case 7: case 8: g_back[f-5]=v; break;
-        case 9: g_pollUs = (uint32_t)(v<1?1:v)*100; persist=false; break;   // pollU100 -> us. SESSION-ONLY: poll rate is locked; this tunes it live but reverts to 800 on reboot.
-        case 10: g_e7b = v?1:0; break;                       // E7 protocol-version B-byte (experimental v1 fast)
-        case 11: g_relayOp = v; break;                       // haptic-relay opcode (buzz hunt)
-        case 12: g_relaySub = v; break;                      // haptic-relay sub-type (buzz hunt)
-        case 13: g_testHaptic = v?v:40; break;               // inject v test haptics (0->40)
-        case 14: g_fwdNewOnly = v?1:0; break;                // Steam: forward only fresh reports (dedupe)
-        case 15: g_qos = v?1:0; g_hopIdx=0; g_qosBad=0; g_qosCheckMs=millis(); break;  // QoS adaptive channel hopping
-        case 16: g_persistMode = v?true:false; break;   // persist last mode across reboots (else always boot Steam)
+          case 1: g_mDiv = v<4?4:v; break;
+          case 2: g_mFric = v>99?99:v; break;
+          case 3: g_padSmooth = v<5?5:(v>100?100:v); break;
+          case 4: g_abSwap = v?1:0; break;
+          case 5: case 6: case 7: case 8: g_back[f-5]=v; break;
+          case 9: g_pollUs = (uint32_t)(v<1?1:v)*100; persist=false; break;   // pollU100 -> us. SESSION-ONLY: poll rate is locked; this tunes it live but reverts to 800 on reboot.
+          case 10: g_e7b = v?1:0; break;                       // E7 protocol-version B-byte (experimental v1 fast)
+          case 11: g_relayOp = v; break;                       // haptic-relay opcode (buzz hunt)
+          case 12: g_relaySub = v; break;                      // haptic-relay sub-type (buzz hunt)
+          case 13: g_testHaptic = v?v:40; break;               // inject v test haptics (0->40)
+          case 14: g_fwdNewOnly = v?1:0; break;                // Steam: forward only fresh reports (dedupe)
+          case 15: g_qos = v?1:0; g_hopIdx=0; g_qosBad=0; g_qosCheckMs=millis(); break;  // QoS adaptive channel hopping
+          case 16: g_persistMode = v?true:false; break;   // persist last mode across reboots (else always boot Steam)
         }
         if(persist) saveCfg();
         webusbSendBlob();
       } else if(op==0x03){
-        uint8_t m=buf[1]; if(m<=3){ webusbSendBlob(); usb_web.flush(); saveMode(m); delay(40); NVIC_SystemReset(); }
+        uint8_t m=buf[1]; if(m<=2){ webusbSendBlob(); usb_web.flush(); saveMode(m); delay(40); NVIC_SystemReset(); }
       }
       memmove(buf,buf+need,n-need); n-=need;
     }
   }
 }
 
-// CDC commands: operational controls only.
+// CDC commands: l=listen, s=stop, cN=channel, p<hex>=prefix, a<8hex>=base addr, b=bonds
 static void rfSerialPoll(){
   static char line[24]; static uint8_t li=0;
   while (Serial.available()){
@@ -1013,13 +1214,16 @@ static void rfSerialPoll(){
       else if (line[0]=='B'){ g_rfBeacon=!g_rfBeacon; g_rfListen=false; Serial.printf("# beacon %s ch%u\n",g_rfBeacon?"ON":"off",g_rfCh); }
       else if (line[0]=='L'){ g_plen=strtol(line+1,0,16); Serial.printf("# plen=%02X\n",g_plen); }
       else if (line[0]=='1'){ g_s1incl=!g_s1incl; Serial.printf("# s1incl=%u\n",g_s1incl); }
-      else if (line[0]=='H'){ g_rfHost=!g_rfHost; g_rfBeacon=false; g_rfListen=false; g_rfCh=2;
+      else if (line[0]=='R'){ g_rfCh=atoi(line+1); g_rfRaw=true; g_rfListen=false; g_rfBeacon=false; rfRawStart(g_rfCh); Serial.printf("# raw cap ch%u\n",g_rfCh); }
+      else if (line[0]=='Z'){ g_rfRaw=true; g_rfSweep=true; g_rfListen=false; g_rfBeacon=false; g_rfCh=2; rfRawStart(g_rfCh); Serial.println("# raw SWEEP"); }
+      else if (line[0]=='H'){ g_rfHost=!g_rfHost; g_rfBeacon=false; g_rfListen=false; g_rfRaw=false; g_rfSweep=false; g_rfCh=2;
         Serial.printf("# HOSTFRAME beacon %s base %02X%02X%02X%02X (slot0 uuids %02X%02X%02X%02X/%02X%02X%02X%02X)\n",
-                      g_rfHost?"ON":"off",g_rfBase[0],g_rfBase[1],g_rfBase[2],g_rfBase[3],
-                      g_slot[0].rec[0],g_slot[0].rec[1],g_slot[0].rec[2],g_slot[0].rec[3],
-                      g_slot[0].rec[4],g_slot[0].rec[5],g_slot[0].rec[6],g_slot[0].rec[7]); }
-      else if (line[0]=='C'){ g_rfBeacon=g_rfListen=g_rfHost=false; rfRespondStart(); }
-      else if (line[0]=='s'){ g_rfListen=false; g_rfBeacon=false; g_rfHost=false; g_rfRespond=false; NRF_RADIO->TASKS_DISABLE=1; Serial.println("# RF off"); }
+          g_rfHost?"ON":"off",g_rfBase[0],g_rfBase[1],g_rfBase[2],g_rfBase[3],
+          g_slot[0].rec[0],g_slot[0].rec[1],g_slot[0].rec[2],g_slot[0].rec[3],
+          g_slot[0].rec[4],g_slot[0].rec[5],g_slot[0].rec[6],g_slot[0].rec[7]); }
+      else if (line[0]=='C'){ g_rfBeacon=g_rfListen=g_rfRaw=g_rfSweep=g_rfHost=false; rfRespondStart(); }
+      else if (line[0]=='s'){ g_rfListen=false; g_rfBeacon=false; g_rfRaw=false; g_rfSweep=false; g_rfHost=false; g_rfRespond=false; NRF_RADIO->TASKS_DISABLE=1; Serial.println("# RF off"); }
+      else if (line[0]=='x'){ uint8_t m=strtoul(line+1,0,10); if(m<=2){ Serial.printf("# switch mode %u (reboot)\n",m); delay(20); saveMode(m); delay(40); NVIC_SystemReset(); } }   // switch USB mode 0=steam 1=xbox 2=switch (lizard is automatic in steam mode)
       else if (line[0]=='c'){ g_rfCh=atoi(line+1); Serial.printf("# ch=%u\n",g_rfCh); if(g_rfListen) rfListenStart(); }
       else if (line[0]=='p'){ g_rfPrefix=strtol(line+1,0,16); Serial.printf("# prefix=%02X\n",g_rfPrefix); if(g_rfListen) rfListenStart(); }
       else if (line[0]=='i'){ g_crcinit=strtoul(line+1,0,16); Serial.printf("# crcinit=%06lX\n",(unsigned long)g_crcinit); }
@@ -1030,6 +1234,8 @@ static void rfSerialPoll(){
       else if (line[0]=='I'){ g_crcinit=strtoul(line+1,0,16); Serial.printf("# crcinit=%08lX\n",(unsigned long)g_crcinit); }
       else if (line[0]=='P'){ g_crcpoly=strtoul(line+1,0,16); Serial.printf("# crcpoly=%lX\n",(unsigned long)g_crcpoly); }
       else if (line[0]=='N'){ g_crccnf=strtoul(line+1,0,16); Serial.printf("# crccnf=%X\n",g_crccnf); }
+      else if (line[0]=='Y'){ g_rfCap=true; g_rfCapOne=true; g_rfReplay=g_rfHost=g_rfAuto=false; g_rfCh=2; rfCapStart(2); Serial.println("# capture ONE frame for replay..."); }
+      else if (line[0]=='y'){ g_rfReplay=!g_rfReplay; g_rfCap=g_rfHost=g_rfAuto=false; Serial.printf("# REPLAY %s (%uB)\n",g_rfReplay?"ON":"off",g_replayLen); }
       else if (line[0]=='T'){ g_statlen=strtoul(line+1,0,16); g_pcnf1=0; Serial.printf("# statlen=%02X\n",g_statlen); }
       else if (line[0]=='k'){ g_connOn=!g_connOn; if(g_connOn){ g_connSt=0; g_connStep=0; g_connPoll=0; g_connF1=0; } Serial.printf("# CONN mode %s: E7-awake[00 00] -> E3+GET-report-0x45 poll on ch%u (param=%02X). F1 seen=%lu\n",g_connOn?"ON":"off",g_rfCh,g_getParam,(unsigned long)g_connF1); }
       else if (line[0]=='q'){ g_getParam = g_getParam ? 0x00 : 0x2D; Serial.printf("# GET-0x45 param=%02X\n",g_getParam); }
@@ -1037,8 +1243,6 @@ static void rfSerialPoll(){
       else if (line[0]=='C'){ g_sessCh=strtoul(line+1,0,10); Serial.printf("# session channel=%u (re-pair/reconnect to apply)\n",g_sessCh); }
       else if (line[0]=='U'){ g_pollUs=strtoul(line+1,0,10); if(g_pollUs<50)g_pollUs=50; Serial.printf("# poll interval=%lu us (~%lu/s) SESSION-ONLY (locked default 800us on reboot)\n",(unsigned long)g_pollUs,(unsigned long)(1000000/g_pollUs)); }
       else if (line[0]=='E'){ g_mDiv=strtoul(line+1,0,10); if(g_mDiv<4)g_mDiv=4; saveCfg(); Serial.printf("# xbox-mouse sensitivity divisor=%d (lower=faster)\n",g_mDiv); }
-      else if (line[0]=='n'){ g_lizDiv=strtoul(line+1,0,10); if(g_lizDiv<8)g_lizDiv=8; Serial.printf("# lizard-mouse sensitivity divisor=%d (higher=slower)\n",g_lizDiv); }
-      else if (line[0]=='m'){ g_lizFric=strtoul(line+1,0,10); if(g_lizFric>99)g_lizFric=99; Serial.printf("# lizard-mouse friction=%d%% (lower=less glide/crisper)\n",g_lizFric); }
       else if (line[0]=='F'){ g_mFric=strtoul(line+1,0,10); if(g_mFric>99)g_mFric=99; saveCfg(); Serial.printf("# xbox-mouse friction=%d%% (higher=more glide/momentum)\n",g_mFric); }
       else if (line[0]=='D'){ g_padSmooth=strtoul(line+1,0,10); if(g_padSmooth<5)g_padSmooth=5; if(g_padSmooth>100)g_padSmooth=100; saveCfg(); Serial.printf("# steam pad smoothing alpha=%d%% (100=off, lower=smoother/laggier)\n",g_padSmooth); }
       else if (line[0]=='W'){ g_abSwap=!g_abSwap; saveCfg(); Serial.printf("# A/B + X/Y swap %s (Nintendo layout)\n",g_abSwap?"ON":"off"); }
@@ -1046,6 +1250,8 @@ static void rfSerialPoll(){
       else if (line[0]=='J'){ char* sp=0; uint8_t id=strtoul(line+1,&sp,0); uint16_t val=sp?strtoul(sp,0,0):0;  // inject SET-SETTINGS to controller: report 0x87 [id][val u16 LE]
         g_relayBuf[0]=0x87; g_relayBuf[1]=3; g_relayBuf[2]=id; g_relayBuf[3]=val&0xFF; g_relayBuf[4]=val>>8; g_relayN=5; g_relayPend=true;
         Serial.printf("# queued SET-SETTINGS id=0x%02X val=%u (relay 0x87) — watch new=/s\n",id,val); }
+      else if (line[0]=='G'){ g_sniff=!g_sniff; g_sniffPh=0; g_rfHost=g_connOn=g_rfCap=g_rfAuto=g_rfReplay=false; if(g_sniff) rfSniffStart(); Serial.printf("# SESSION SNIFF %s (phase0: catch host frame on ibex/ch2; phase1 PARK ch=%s)\n",g_sniff?"ON":"off",g_sniffPark?"override":"primary"); }
+      else if (line[0]=='g'){ g_sniffPark=strtoul(line+1,0,10); if(g_sniffPh==1) rfSniffStart(); Serial.printf("# sniff park channel=%u (0=learned primary)\n",g_sniffPark); }
       else if (line[0]=='V'){ g_e7b=strtoul(line+1,0,10); Serial.printf("# E7 protocol-version B-byte=%u (0=awake/slow, 1=try v1-fast; watch new=/s; revert if input stops)\n",g_e7b); }
       else if (line[0]=='O'){ g_relayOp=strtoul(line+1,0,16); Serial.printf("# relay opcode=%02X\n",g_relayOp); }
       else if (line[0]=='o'){ g_relaySub=strtoul(line+1,0,16); Serial.printf("# relay sub-type=%02X\n",g_relaySub); }
@@ -1060,6 +1266,8 @@ static void rfSerialPoll(){
       else if (line[0]=='A'){ g_balen=strtoul(line+1,0,16); g_pcnf1=0; Serial.printf("# balen=%u\n",g_balen); }
       else if (line[0]=='a'){ uint32_t v=strtoul(line+1,0,16); g_rfBase[0]=v>>24;g_rfBase[1]=v>>16;g_rfBase[2]=v>>8;g_rfBase[3]=v; Serial.printf("# base=%08lX\n",(unsigned long)v); if(g_rfListen) rfListenStart(); }
       else if (line[0]=='b'){ for(int i=0;i<NSLOT;i++) if(g_slot[i].used){Serial.printf("slot%d ",i); for(int j=0;j<24;j++)Serial.printf("%02X",g_slot[i].rec[j]); Serial.println();} }
+      else if (line[0]=='X'){ g_rfCap=!g_rfCap; g_rfHost=g_rfAuto=g_rfBeacon=g_rfListen=g_rfRaw=g_rfSweep=g_rfRespond=false; g_rfCh=2; g_capV=0; if(g_rfCap) rfCapStart(g_rfCh); Serial.printf("# CAPTURE(listen) %s ch%u on \"ibex\", cycling 1M/2M x BALEN3/4 (use cN to set ch)\n", g_rfCap?"ON":"off",g_rfCh); }
+      else if (line[0]=='S'){ g_rfAuto=!g_rfAuto; g_rfHost=g_rfAuto; g_rfBeacon=g_rfListen=g_rfRaw=g_rfSweep=false; g_rfCh=2; g_cfgIdx=0; if(g_rfAuto) applyCfg(0); Serial.printf("# AUTOSWEEP %s (%u cfgs x300ms)\n", g_rfAuto?"ON":"off",(unsigned)(sizeof SWEEP/sizeof SWEEP[0])); }
       li=0;
     } else if (li<sizeof line-1) line[li++]=c;
   }
@@ -1069,29 +1277,49 @@ void setup() {
   genSerial();
   InternalFS.begin();
   loadCfg(); g_xbox = (g_usbMode != 0);   // load persisted config + decide USB presentation BEFORE registering interfaces
-  USBDevice.setSerialDescriptor(g_unit);
-  if (g_usbMode == 1) {                // XBOX presentation: XInput gamepad + mouse only (no puck)
-    USBDevice.setID(0x045E, 0x028E);   // Microsoft Xbox 360 wired controller (so Steam/SDL bind it as Xbox 360)
-    USBDevice.setVersion(0x0200); USBDevice.setDeviceVersion(0x0114);
+
+  // ---- CLEAN, NON-COMPOSITE presentation for Xbox + Switch ----
+  // The Adafruit core auto-adds a CDC (Serial) interface at startup, making every device a CDC composite
+  // (bDeviceClass=0xEF/IAD). That breaks the two real-controller personalities:
+  //   * XBOX: Windows' xusb (Xbox 360) driver matches 045E:028E at the DEVICE level. In a composite the
+  //     gamepad is interface MI_02 and xusb's INF never matches it -> the controller never appears. (Dropping
+  //     only the mouse earlier left the device composite, so it stayed broken on every host.)
+  //   * SWITCH: a real console rejects composite devices outright; it accepts only a bare HID gamepad.
+  // Fix: tear the auto CDC composite down and rebuild a single-interface device. clearConfiguration() also
+  // resets bDeviceClass to 0x00 (single function). We deliberately KEEP bcdUSB at 0x0200 (no WebUSB / USB 2.1)
+  // so the host never requests the WebUSB BOS — whose MS-OS-2.0 blob would otherwise tell Windows to bind
+  // WinUSB to interface 0 (our gamepad). detach()/attach() forces the host to re-read the rebuilt descriptor.
+  // Force a CLEAN re-enumeration on every boot / mode-switch: detach FIRST so the host drops the previous
+  // identity, rebuild the descriptor, then re-attach (at the end of setup). This is done in ALL modes, not
+  // just the clean ones: switching Xbox->Steam while Steam holds the device open could otherwise leave the
+  // host caching the old 045E:028E device, so the puck sometimes failed to enumerate. The detach gives the OS
+  // an unambiguous disconnect to release its handles before the new descriptor comes up.
+  const bool cleanDevice = (g_usbMode == 1 || g_usbMode == 2);
+  USBDevice.detach(); delay(30);
+  if (cleanDevice) USBDevice.clearConfiguration();   // clean modes also drop the auto CDC composite (resets bDeviceClass=0)
+
+  // Distinct USB serial PER MODE (must be set AFTER clearConfiguration, which nulls it). Hosts cache USB
+  // identity by VID:PID:serial; reusing one serial under a changing VID:PID can make a host refuse the new
+  // identity. Steam keeps the exact unit serial (its pairing identity); the others get a 1-char suffix.
+  if (g_usbMode == 0) { USBDevice.setSerialDescriptor(g_unit); }
+  else { snprintf(g_usbSerial, sizeof g_usbSerial, "%s%c", g_unit, g_usbMode==1?'X':'N'); USBDevice.setSerialDescriptor(g_usbSerial); }
+  if (g_usbMode == 1) {                // XBOX presentation: a LONE XInput vendor interface == a real wired Xbox 360 pad
+    USBDevice.setID(0x045E, 0x028E);   // device-level 045E:028E match -> Windows xusb / SDL / Linux xpad all bind it
+    USBDevice.setVersion(0x0200); USBDevice.setDeviceVersion(0x0114);   // bcdUSB 0x0200 = no BOS request (clean, no WinUSB fight)
     USBDevice.setManufacturerDescriptor("Microsoft");
     USBDevice.setProductDescriptor("Controller");
-    g_xinput.setStringDescriptor("Controller"); g_xinput.begin();   // XInput vendor interface (FF/5D/01)
-    g_mouse.setReportDescriptor(MOUSE_HID_DESC, sizeof MOUSE_HID_DESC); g_mouse.setPollInterval(1); g_mouse.begin();
-  } else if (g_usbMode == 2) {         // SWITCH presentation: HORIPAD/Pokkén pad (console-compatible)
-    USBDevice.setID(0x0F0D, 0x0092);   // HORI Pokkén Tournament Pro Pad (accepted by a real Switch console)
+    g_xinput.setStringDescriptor("Controller"); g_xinput.begin();   // XInput vendor interface (FF/5D/01) -> MI_00
+    g_mouse.setReportDescriptor(MOUSE_HID_DESC, sizeof MOUSE_HID_DESC); g_mouse.setPollInterval(1); g_mouse.begin();   // right-pad mouse -> MI_01 (no CDC/WebUSB, so XInput stays MI_00)
+  } else if (g_usbMode == 2) {         // SWITCH presentation: a LONE HID HORIPAD/Pokkén pad (console-compatible)
+    USBDevice.setID(0x0F0D, 0x0092);   // HORI Pokkén Tournament Pro Pad (whitelisted by a real Switch console)
     USBDevice.setVersion(0x0200); USBDevice.setDeviceVersion(0x0200);
     USBDevice.setManufacturerDescriptor("HORI CO.,LTD.");
     USBDevice.setProductDescriptor("POKKEN CONTROLLER");
+    g_switch.enableOutEndpoint(true);  // real HORIPAD has an interrupt OUT ep (the descriptor declares an output report); the console expects the bidirectional interface
     g_switch.setReportDescriptor(SWITCH_HID_DESC, sizeof SWITCH_HID_DESC);
     g_switch.setPollInterval(8);       // 8ms (~125Hz); we stream the 8-byte report (no handshake needed)
     g_switch.begin();
-  } else if (g_usbMode == 3) {         // LIZARD presentation: plain desktop keyboard + mouse (driverless)
-    USBDevice.setID(0x28DE, 0x1102);   // Valve VID, distinct PID; KB+mouse are boot-protocol so the IDs don't matter functionally
-    USBDevice.setManufacturerDescriptor("Valve Software");
-    USBDevice.setProductDescriptor("Steam Controller (Desktop)");
-    g_mouse.setReportDescriptor(MOUSE_HID_DESC, sizeof MOUSE_HID_DESC); g_mouse.setPollInterval(1); g_mouse.begin();
-    g_keyboard.setReportDescriptor(KEYBOARD_HID_DESC, sizeof KEYBOARD_HID_DESC); g_keyboard.setPollInterval(1); g_keyboard.begin();
-  } else {                             // STEAM presentation: the 4 puck slot interfaces
+  } else {                             // STEAM presentation: the 4 puck slot interfaces (desktop lizard is automatic when Steam is closed)
     USBDevice.setID(0x28DE, 0x1304);
     USBDevice.setManufacturerDescriptor("Valve Software");
     USBDevice.setProductDescriptor("Steam Controller Puck");
@@ -1102,11 +1330,15 @@ void setup() {
       hid[i].begin();
     }
   }
-  usb_web.begin();   // config panel (present in every mode); no landing page -> no Chrome auto-notification
+  // WebUSB config panel: only in STEAM mode (the one composite mode). Xbox/Switch are clean controllers —
+  // adding a vendor config interface (and the USB-2.1 BOS it forces) would re-create the exact composite that
+  // stops them binding. In those modes, reconfigure over RF (back-paddle chord) or from Steam mode.
+  if (g_usbMode == 0) usb_web.begin();   // no landing page -> no Chrome auto-notification
+  USBDevice.attach();   // re-connect with the final descriptor (host re-reads it fresh -> deterministic enumeration)
   Serial.begin(115200);
-  while (!USBDevice.mounted()) delay(10);
-  loadBonds();
-  Serial.printf("# openpuck up: unit=%s board=%s, mode=%s\n", g_unit, g_board, g_usbMode==1?"XBOX(gamepad+mouse)":g_usbMode==2?"SWITCH(pro controller)":g_usbMode==3?"LIZARD(keyboard+mouse)":"STEAM(puck)");
+  for (int i=0; i<300 && !USBDevice.mounted(); i++) delay(10);   // wait up to 3s for USB mount, but NEVER hang:
+  loadBonds();                                                   // if a mode fails to enumerate, still run loop() so RF + the back-paddle mode chord keep working (can always switch back)
+  Serial.printf("# copycat up: unit=%s board=%s, mode=%s\n", g_unit, g_board, g_usbMode==1?"XBOX(controller+mouse)":g_usbMode==2?"SWITCH(pro controller)":"STEAM(puck; auto-lizard when Steam closed)");
 }
 
 void loop() {
@@ -1116,7 +1348,16 @@ void loop() {
   rfSerialPoll();
   rfPoll();
   rfRespondPoll();
+  rfCapPoll();
+  if (g_rfCap && millis() - g_lastHop >= 90) {    // sweep DATAWHITEIV (0..127) x BALEN{3,4} on ch2, CRC-validate
+    g_lastHop = millis(); g_capV = (uint8_t)(g_capV+1); rfCapStart(g_rfCh);
+  }
   if (g_rfBeacon && millis() - g_lastBeacon >= 5) { g_lastBeacon = millis(); rfBeaconOnce(); }
+  if (g_rfSweep && millis() - g_lastHop >= 60) { g_lastHop = millis(); g_rfCh += 2; if (g_rfCh > 80) g_rfCh = 2; rfRawStart(g_rfCh); }
+  if (g_rfAuto && millis() - g_lastCfg >= 500) {   // advance to next candidate config every 500ms
+    g_lastCfg = millis(); g_cfgIdx = (g_cfgIdx + 1) % (sizeof SWEEP/sizeof SWEEP[0]); applyCfg(g_cfgIdx);
+  }
+  if (g_rfReplay) { rfReplayOnce(); }   // bit-perfect replay of a captured real-puck frame on ch2
   // Host-frame beacon: sent continuously, INCLUDING while connected. The controller uses the periodic E1
   // (the real puck's per-hop-cycle announce) to stay synced and keep answering polls at full rate;
   // suppressing it drops the reply rate from ~210/s to ~38/s. Paused only during the post-disconnect
@@ -1171,7 +1412,9 @@ void loop() {
       }
     } else if(!conn) usbConn=false;
   }
-  if (g_connOn && millis()-g_stMs>=1000){ g_f1ps=g_stF1; g_newps=g_stNew; if(Serial.availableForWrite()>70) Serial.printf("# stat polls=%lu/s F1=%lu/s new=%lu/s F3=%lu/s(v%d) e7b=%u crcfail=%lu noRx=%lu slot=%d\n",(unsigned long)g_stPoll,(unsigned long)g_stF1,(unsigned long)g_stNew,(unsigned long)g_stF3,(int8_t)g_connF3v,g_e7b,(unsigned long)g_stCrc,(unsigned long)g_stNoRx,g_connSlot); g_stPoll=0; g_stF1=0; g_stNew=0; g_stF3=0; g_stCrc=0; g_stNoRx=0; g_stMs=millis(); }
+  if (g_connOn && millis()-g_stMs>=1000){ g_f1ps=g_stF1; g_newps=g_stNew; if(Serial.availableForWrite()>70) Serial.printf("# stat polls=%lu/s F1=%lu/s new=%lu/s F3=%lu/s(v%d) e7b=%u crcfail=%lu noRx=%lu slot=%d\n",(unsigned long)g_stPoll,(unsigned long)g_stF1,(unsigned long)g_stNew,(unsigned long)g_stF3,(int8_t)g_connF3v,g_e7b,(unsigned long)g_stCrc,(unsigned long)g_stNoRx,g_connSlot); g_stPoll=0; g_stF1=0; g_stNew=0; g_stF3=0; g_stCrc=0; g_stNoRx=0; g_chF1[0]=g_chF1[1]=g_chF1[2]=0; g_stMs=millis(); }
+  rfSniffPoll();
+  // phase-1 PARKS (no hop) on the primary/override channel — re-arm RX only if it dropped (handled in rfSniffPoll via SHORTS END_START)
   if (g_rfRespond && millis() - g_lastHop >= 25) {          // scan the 3 BLE adv channels w/ matched whitening
     g_lastHop = millis();
     static const uint8_t advf[3]={2,26,80}, advw[3]={37,38,39}; static uint8_t ai=0; ai=(ai+1)%3;
