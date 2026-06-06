@@ -23,6 +23,9 @@ At any point you can hold all 4 back buttons and press X to switch over to ***Xb
 
 Similarly you can hold all 4 back buttons and press Y to switch (teehee) over to a **Switch mode**. This emulates a Pokken controller and is very limited (no gyro, no haptics, etc) but it's functional enough for my kids to play Animal Crossing :D.
 
+# How to use it
+You will need to flash OpenPuck.ino onto a compatible microcontroller. See [build instructions document](./docs/BUILD_AND_DEPLOY.md) for more details.
+
 # Configuration
 A webusb based configuration UI is available at <link>. It allows Switching the mode manually and changing the back button mapping for Xbox mode among other things. This will likely only work in Chrome and Edge and needs the pro micro to be connected via USB to the same computer for it to function.
 
