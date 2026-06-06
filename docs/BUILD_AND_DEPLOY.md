@@ -47,7 +47,7 @@ If your CLI config does not already include the Adafruit package index, add it f
 ```yaml
 board_manager:
   additional_urls:
-    - https://www.adafruit.com/package_adafruit_index.json
+    - https://adafruit.github.io/arduino-board-index/package_adafruit_index.json
 ```
 
 Then rerun `arduino-cli core update-index`.
@@ -60,7 +60,7 @@ From the repository root:
 arduino-cli compile \
   -b adafruit:nrf52:feather52840 \
   --build-property "build.extra_flags=-DNRF52840_XXAA {build.flags.usb} -DCFG_TUD_HID=4" \
-  .
+  OpenPuck
 ```
 
 This sketch requires `CFG_TUD_HID=4` because Steam mode exposes four HID interfaces.
@@ -81,7 +81,7 @@ Upload:
 arduino-cli upload \
   -b adafruit:nrf52:feather52840 \
   -p /dev/ttyACM0 \
-  .
+  OpenPuck
 ```
 
 Replace `/dev/ttyACM0` with the actual port. On macOS it is usually `/dev/cu.usbmodem*`.
@@ -100,7 +100,7 @@ Upload:
 arduino-cli upload `
   -b adafruit:nrf52:feather52840 `
   -p COM5 `
-  .
+  OpenPuck
 ```
 
 Replace `COM5` with the actual board port.
