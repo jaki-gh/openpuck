@@ -999,6 +999,16 @@ static uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t* payload, uint8_t 
             const uint8_t* rep=&rfrx[idx+2];            // report 0x45: [0x45][seq][buttons u32]...
             bool fresh=(rep[1]!=g_lastSeq); if(fresh){ g_stNew++; g_lastSeq=rep[1]; }  // genuine new report vs stale poll-repeat
             uint32_t bb=btnsOf(rep);
+            // USB remote wakeup on Steam button short press (down + up within 1 s).
+            // A long press likely means the user is powering off the controller, so we ignore it.
+            { static bool steamWasDown=false; static unsigned long steamDownMs=0;
+              if(fresh){
+                bool steamNow=(bb & TB_STEAM)!=0;
+                if(steamNow && !steamWasDown) steamDownMs=millis();                                                            // rising edge: record press time
+                if(!steamNow && steamWasDown && millis()-steamDownMs<1000u && USBDevice.suspended()) USBDevice.remoteWakeup(); // falling edge within 1 s -> short press -> wake
+                steamWasDown=steamNow;
+              }
+            }
             // cache the latest decoded frame for the Switch streamer + Xbox/Steam paths
             g_swBtns=bb; g_swLX=(int16_t)s16off(rep,8); g_swLY=(int16_t)s16off(rep,10);
             g_swRX=(int16_t)s16off(rep,12); g_swRY=(int16_t)s16off(rep,14);
@@ -1037,7 +1047,7 @@ static uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t* payload, uint8_t 
         { static uint8_t chWant=0xFF, chCnt=0;
           const uint32_t BACK4=TB_R4|TB_L4|TB_R5|TB_L5; uint8_t want=0xFF;
           if((g_swBtns&BACK4)==BACK4){ if(g_swBtns&TB_A)want=0; else if(g_swBtns&TB_X)want=1; else if(g_swBtns&TB_Y)want=2; }  // back4 + A=Steam X=Xbox Y=Switch (lizard is automatic in Steam mode now)
-          if(want!=0xFF && want==chWant){ if(++chCnt>=12 && want!=g_usbMode){ saveMode(want); delay(40); NVIC_SystemReset(); } }
+          if(want!=0xFF && want==chWant){ if(++chCnt>=12 && want!=g_usbMode && !USBDevice.suspended()){ saveMode(want); delay(40); NVIC_SystemReset(); } }
           else { chWant=want; chCnt=(want!=0xFF)?1:0; }
         }
         // compact stream for rf_controller_ui.py — NON-BLOCKING: skip if CDC TX is backed up (a blocking
@@ -1262,7 +1272,7 @@ static void webusbPoll(){
         if(persist) saveCfg();
         webusbSendBlob();
       } else if(op==0x03){
-        uint8_t m=buf[1]; if(m<=2){ webusbSendBlob(); usb_web.flush(); saveMode(m); delay(40); NVIC_SystemReset(); }
+        uint8_t m=buf[1]; if(m<=2 && !USBDevice.suspended()){ webusbSendBlob(); usb_web.flush(); saveMode(m); delay(40); NVIC_SystemReset(); }
       }
       memmove(buf,buf+need,n-need); n-=need;
     }
@@ -1288,7 +1298,10 @@ static void rfSerialPoll(){
           g_slot[0].rec[4],g_slot[0].rec[5],g_slot[0].rec[6],g_slot[0].rec[7]); }
       else if (line[0]=='C'){ g_rfBeacon=g_rfListen=g_rfRaw=g_rfSweep=g_rfHost=false; rfRespondStart(); }
       else if (line[0]=='s'){ g_rfListen=false; g_rfBeacon=false; g_rfRaw=false; g_rfSweep=false; g_rfHost=false; g_rfRespond=false; NRF_RADIO->TASKS_DISABLE=1; Serial.println("# RF off"); }
-      else if (line[0]=='x'){ uint8_t m=strtoul(line+1,0,10); if(m<=2){ Serial.printf("# switch mode %u (reboot)\n",m); delay(20); saveMode(m); delay(40); NVIC_SystemReset(); } }   // switch USB mode 0=steam 1=xbox 2=switch (lizard is automatic in steam mode)
+      else if (line[0]=='x'){ uint8_t m=strtoul(line+1,0,10); if(m<=2){
+        if(USBDevice.suspended()){ Serial.println("# mode change blocked: host suspended"); }
+        else { Serial.printf("# switch mode %u (reboot)\n",m); delay(20); saveMode(m); delay(40); NVIC_SystemReset(); }
+      } }   // switch USB mode 0=steam 1=xbox 2=switch (lizard is automatic in steam mode)
       else if (line[0]=='c'){ g_rfCh=atoi(line+1); Serial.printf("# ch=%u\n",g_rfCh); if(g_rfListen) rfListenStart(); }
       else if (line[0]=='p'){ g_rfPrefix=strtol(line+1,0,16); Serial.printf("# prefix=%02X\n",g_rfPrefix); if(g_rfListen) rfListenStart(); }
       else if (line[0]=='i'){ g_crcinit=strtoul(line+1,0,16); Serial.printf("# crcinit=%06lX\n",(unsigned long)g_crcinit); }
@@ -1407,9 +1420,13 @@ void setup() {
   // adding a vendor config interface (and the USB-2.1 BOS it forces) would re-create the exact composite that
   // stops them binding. In those modes, reconfigure over RF (back-paddle chord) or from Steam mode.
   if (g_usbMode == 0) usb_web.begin();   // no landing page -> no Chrome auto-notification
+  // Enable USB Remote Wakeup (bit 5) so the host lets us signal wake-from-sleep. Bit 7 is always required.
+  // The host OS enables device wakeup via SET_FEATURE(DEVICE_REMOTE_WAKEUP); we assert the capability here.
+  USBDevice.setConfigurationAttribute(0x80 | 0x20);  // bmAttributes: required(0x80) | remote_wakeup(0x20)
   USBDevice.attach();   // re-connect with the final descriptor (host re-reads it fresh -> deterministic enumeration)
   Serial.begin(115200);
   for (int i=0; i<300 && !USBDevice.mounted(); i++) delay(10);   // wait up to 3s for USB mount, but NEVER hang:
+  if (USBDevice.suspended()) USBDevice.remoteWakeup();             // wake host if bus was sleeping when we (re-)attached (e.g. after a mode change)
   loadBonds();                                                   // if a mode fails to enumerate, still run loop() so RF + the back-paddle mode chord keep working (can always switch back)
   Serial.printf("# copycat up: unit=%s board=%s, mode=%s\n", g_unit, g_board, g_usbMode==1?"XBOX(controller+mouse)":g_usbMode==2?"SWITCH(pro controller)":"STEAM(puck; auto-lizard when Steam closed)");
   // Hardware watchdog: if loop() ever stops feeding it (a wedged radio busy-wait, a HardFault spin, a blocked
@@ -1453,6 +1470,11 @@ void loop() {
     if (millis()-g_lastDisc >= (connNow ? 200u : 0u)) { g_lastDisc=millis(); g_rfCh=2; for (int s=0;s<NSLOT;s++) rfHostFrameOnce(s); }
   }
   if (g_connOn && millis()-g_connCooldown > 2500) { rfConnStep(); }            // connected-mode: poll controller, read input
+  { static bool wasRfConn=false;                                               // remote wakeup on new RF controller connection
+    bool nowRfConn=(g_connSlot>=0 && millis()-g_connReplyMs<300);
+    if(nowRfConn && !wasRfConn && USBDevice.suspended()) USBDevice.remoteWakeup();
+    wasRfConn=nowRfConn;
+  }
   { static bool wasHapticLinkUp=false;
     bool up=hapticLinkUp();
     if(up && !wasHapticLinkUp){ g_hapticBlockUntil = millis() + HAPTIC_RECONNECT_BLOCK_MS; g_hapticStop=4; }   // reconnect: drop Steam's stale startup haptics AND clear any haptic that latched on the controller before/across the switch (the "whine until Steam button" on entering Steam mode)
