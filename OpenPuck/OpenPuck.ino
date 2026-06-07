@@ -290,15 +290,17 @@ static void haptic82HostReport(const uint8_t* p, uint16_t n){
 
 // ---- command channel; `slot` is the interface index (interface N == bond slot N) ----
 static void handleSet(int slot, uint8_t rid, hid_report_type_t type, uint8_t const *b, uint16_t n) {
-  if (type == HID_REPORT_TYPE_OUTPUT) {   // Steam haptic/LED OUTPUT reports 0x80-0x89 -> relay to controller
-    if (rid >= 0x80 && rid <= 0x89 && n >= 1) {                 // wrap as a SET sub-TLV like the report-01 path
-      bool haptic82 = (rid == 0x82);
-      if (!haptic82 || !haptic82Blocked()) {
+  if (type == HID_REPORT_TYPE_OUTPUT) {   // Steam OUTPUT reports 0x80-0x89. ONLY the haptic (0x82) is relayed to
+    // the controller, and ONLY when it arrives on the CONNECTED slot's interface. We have one controller but
+    // expose 4 puck slots; forwarding the other 0x80-0x89 reports (LED/config), or a haptic Steam aimed at a
+    // different slot, made the controller buzz at random. The real puck (4 independent slots) never does that.
+    if (rid == 0x82 && n >= 1 && slot == g_connSlot) {          // wrap as a SET sub-TLV like the report-01 path
+      if (!haptic82Blocked()) {
         uint8_t m = n > (uint16_t)(sizeof g_relayBuf - 2) ? (sizeof g_relayBuf - 2) : n;
         g_relayBuf[0] = rid; g_relayBuf[1] = m; memcpy(g_relayBuf + 2, b, m);
         g_relayN = m + 2; g_relayPend = true;
       }
-      if (haptic82) haptic82HostReport(b, n);  // track on/off for the stuck-haptic watchdog
+      haptic82HostReport(b, n);  // track on/off for the stuck-haptic watchdog
     }
     if (Serial.availableForWrite() > 80) {                      // log so we can see what Steam actually sends (e.g. glide haptics)
       Serial.printf("# OUT if%d rid=%02X n=%u:", slot, rid, n);
