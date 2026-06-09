@@ -206,12 +206,23 @@ Because the discovery address is shared, two things prevent one puck from distur
 
 ## Wake from sleep
 
-The puck can wake a sleeping host via `USBDevice.remoteWakeup()` — driven from `rf_link.cpp` on a Steam-button
-short-press or a fresh RF reconnect (guarded by `USBDevice.suspended()`). Every mode advertises the
-remote-wakeup capability in its config descriptor, so the device is always *armed*. The catch is that a host
-only *honors* a resume signal from an allow-listed input device class (HID keyboard/mouse) — a bare
-gamepad/vendor/composite presentation gets armed but ignored (notably Windows under Modern Standby). That's
-why Xbox mode (which exposes a boot mouse) woke Windows while the gamepad/puck modes didn't.
+Waking the host is an **explicit gesture, never a side effect of input**. While the bus is suspended, the puck
+personality sends *nothing* (no `0x45` forwards, no lizard mouse/keyboard, no periodic `0x79`/`0x7B` status) —
+a suspended-bus `sendReport` can itself translate into a host wake, which made the PC wake on any trackpad
+graze and nearly impossible to keep asleep. The only wake triggers are a **Steam-button short press** or a
+**controller connect**, detected in `rf_link.cpp` (guarded by `USBDevice.suspended()`). Each fires two things:
+
+1. `USBDevice.remoteWakeup()` — the device-level USB resume signal; and
+2. `g_active->wakeEvent()` — the controller queues a **wake nudge**: once the bus has resumed, the puck
+   personality sends a deliberate space-bar press+release (keyboard report `0x41`) and a mouse click
+   press+release (report `0x40`) on its own interface (`wakeNudgeTask` in `puck_hid.cpp`). The nudge exists
+   because some hosts ignore a bare resume signal unless real keyboard/mouse input follows it; it can't be
+   sent *during* suspend (reports can't cross a suspended bus), so it's delivered immediately after resume.
+
+Every mode advertises the remote-wakeup capability in its config descriptor, so the device is always *armed*.
+The catch is that a host only *honors* a resume from an allow-listed input device class (HID keyboard/mouse) —
+a bare gamepad/vendor/composite presentation gets armed but ignored (notably Windows under Modern Standby).
+That's why Xbox mode (which exposes a boot mouse) woke Windows while the gamepad/puck modes didn't.
 
 The fix: `wake_hid.cpp` registers a do-nothing **boot mouse** interface (the same shape Xbox mode already uses
 to wake Windows) so each mode is classified as a wake-capable input device. It's added in `setup()` for every
@@ -223,6 +234,12 @@ Deck; making it wake Windows is the one case this doesn't cover without that tra
 Note hosts differ in what they honor: Windows keys on the input device class (this fix targets it); Linux/Steam
 Deck gates wake per-device in `/sys/.../power/wakeup` regardless of class, so a mode that still won't wake the
 Deck may just need that sysfs flag enabled host-side.
+
+**`bcdDevice` rule:** Windows caches a device's configuration descriptor keyed by `VID:PID:bcdDevice`. If you
+change a mode's interfaces (as adding the wake mouse did) without bumping that mode's `setDeviceVersion(...)`,
+Windows keeps serving the stale cached descriptor — the change is invisible and wake silently breaks, with no
+fix short of the user manually uninstalling the device. So: **whenever you change a mode's USB descriptor, bump
+its `bcdDevice`.** The clean modes were bumped for the wake interface; each `begin()` documents its value.
 
 ## RF reverse-engineering tooling
 

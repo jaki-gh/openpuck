@@ -142,7 +142,10 @@ static void rfXboxMouse(const uint8_t* r){
 void XboxController::begin(){
   g_rumble=0;
   USBDevice.setID(0x045E, 0x028E);   // device-level 045E:028E match -> Windows xusb / SDL / Linux xpad all bind it
-  USBDevice.setDeviceVersion(0x0114);
+  // bcdDevice 0x0115 (was 0x0114): Windows caches the config descriptor by VID:PID:bcdDevice, so any change to
+  // this mode's interfaces (here: the wake-mouse interface) MUST bump bcdDevice or Windows serves a stale
+  // descriptor and the change is invisible (no manual Device-Manager cache-clear should ever be needed).
+  USBDevice.setDeviceVersion(0x0115);
   USBDevice.setManufacturerDescriptor("Microsoft");
   USBDevice.setProductDescriptor("Controller");
   g_xinput.setStringDescriptor("Controller"); g_xinput.begin();   // XInput vendor interface (FF/5D/01) -> MI_00

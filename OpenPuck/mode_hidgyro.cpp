@@ -55,7 +55,7 @@ static void hidGyroBuild(uint8_t out[63]){
 
 void HidGyroController::begin(){
   USBDevice.setID(0x054C, 0x05C4);
-  USBDevice.setDeviceVersion(0x0100);
+  USBDevice.setDeviceVersion(0x0101);   // bumped from 0x0100 for the added wake-mouse interface (Windows caches config by VID:PID:bcdDevice)
   USBDevice.setManufacturerDescriptor("Sony Computer Entertainment");
   USBDevice.setProductDescriptor("Wireless Controller");
   g_hidGyro.enableOutEndpoint(true);

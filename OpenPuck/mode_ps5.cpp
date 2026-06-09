@@ -57,7 +57,7 @@ static void ps5Build(uint8_t out[63]){
 
 void Ps5Controller::begin(){
   USBDevice.setID(0x054C, 0x0CE6);
-  USBDevice.setDeviceVersion(0x0100);
+  USBDevice.setDeviceVersion(0x0101);   // bumped from 0x0100 for the added wake-mouse interface (Windows caches config by VID:PID:bcdDevice)
   USBDevice.setManufacturerDescriptor("Sony Interactive Entertainment");
   USBDevice.setProductDescriptor("DualSense Wireless Controller");
   g_ps5.enableOutEndpoint(true);

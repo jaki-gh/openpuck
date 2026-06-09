@@ -203,7 +203,7 @@ static void jcSet(uint8_t rid, hid_report_type_t type, uint8_t const* b, uint16_
 
 void SwitchProController::begin(){
   USBDevice.setID(0x057E, 0x2009);
-  USBDevice.setDeviceVersion(0x0210);
+  USBDevice.setDeviceVersion(0x0211);   // bumped from 0x0210 for the added wake-mouse interface (Windows caches config by VID:PID:bcdDevice)
   USBDevice.setManufacturerDescriptor("Nintendo Co., Ltd.");
   USBDevice.setProductDescriptor("Pro Controller");
   jcBuildStickCal();
