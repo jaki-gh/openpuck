@@ -66,7 +66,7 @@ void setup() {
 
   g_active->begin();   // register this mode's USB interface(s) + set VID/PID/strings
 
-  // Boot-keyboard wake interface so the host honors USBDevice.remoteWakeup() in this mode (see wake_hid.h).
+  // Boot-mouse wake interface so the host honors USBDevice.remoteWakeup() in this mode (see wake_hid.h).
   // Skipped in puck mode: its CDC + 4 HID + WebUSB composite already uses all 7 data IN endpoints.
   if (!puckMode) wakeHidBegin();
 

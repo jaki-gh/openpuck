@@ -5,9 +5,10 @@
 // TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP), so the device is *armed* to wake the host. But hosts only *honor* a
 // remote-wakeup resume signal from an allow-listed input device class -- a HID keyboard/mouse. Windows
 // (especially under Modern Standby) ignores the wake from a bare gamepad / vendor / composite presentation
-// even though it's armed. Exposing a boot keyboard interface puts the device in that allow-list. It never
-// sends reports -- the actual wake is the device-level USBDevice.remoteWakeup() resume signal driven from
-// rf_link.cpp; this interface only changes how the host classifies us.
+// even though it's armed. Exposing a boot MOUSE interface (the same shape Xbox mode already uses to wake
+// Windows) puts the device in that allow-list. It never sends reports -- the actual wake is the device-level
+// USBDevice.remoteWakeup() resume signal driven from rf_link.cpp; this interface only changes how the host
+// classifies us. (A boot keyboard was tried and was worse -- it didn't enumerate on Windows.)
 //
 // NOT used in puck (Steam) mode: that composite (CDC + 4 puck HID + WebUSB) already consumes all 7 of the
 // nRF52840's data IN endpoints, leaving no room for another interface. (Puck mode already wakes on Linux/Deck;
