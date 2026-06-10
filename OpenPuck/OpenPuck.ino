@@ -80,7 +80,7 @@ void setup() {
   USBDevice.attach();   // re-connect with the final descriptor (host re-reads it fresh -> deterministic enumeration)
   Serial.begin(115200);
   for (int i=0; i<300 && !USBDevice.mounted(); i++) delay(10);   // wait up to 3s for USB mount, but NEVER hang
-  if (USBDevice.suspended()) USBDevice.remoteWakeup();           // wake host if bus was sleeping when we (re-)attached
+  if (USBDevice.suspended()){ USBDevice.remoteWakeup(); ledWakePulse(); }   // wake host if bus was sleeping when we (re-)attached
   loadBonds();
   hapticInit();   // clear relay/active flags + arm the reconnect block & initial stop burst
   static const char* MODE_NAME[]={"STEAM(puck)","XBOX(xinput+mouse)","SWITCH(horipad)","LIZARD(puck kb/mouse)","SWITCH(pro+gyro)","PS5(dualsense)","HIDGYRO(ds4+motion)"};
@@ -105,5 +105,5 @@ void loop() {
   rfDiagTask();                     // service whichever RF RE/calibration mode is active (no-op in normal use)
   rfLinkTask();                     // host-frame beacons + connected-mode poll (decodes input -> g_in -> active controller) + QoS + stats
   hapticTask();                     // reconnect-block edge handling + steam 0x82 quiet timeout
-  ledTask();                        // blip the LED while wake is armed (host suspended)
+  ledTask();                        // times out the 500ms wake-sent LED flash
 }

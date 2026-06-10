@@ -1,10 +1,11 @@
 #include "status_led.h"
-#include <Adafruit_TinyUSB.h>
 #include <Arduino.h>
 
 #define WAKE_LED_OFF ((WAKE_LED_ON)==HIGH ? LOW : HIGH)
-#define BLIP_PERIOD_MS 2000u   // one blip every 2s while wake-armed
-#define BLIP_ON_MS       60u   // ~3% duty: visible at a glance, not a bedroom nightlight
+#define PULSE_MS 500u   // wake flash duration
+
+static unsigned long g_pulseMs = 0;
+static bool g_lit = false;
 
 static void ledWrite(int level){
   digitalWrite(WAKE_LED_PIN_A, level);
@@ -17,11 +18,11 @@ void ledInit(){
   ledWrite(WAKE_LED_OFF);
 }
 
+void ledWakePulse(){
+  g_pulseMs = millis(); g_lit = true;
+  ledWrite(WAKE_LED_ON);   // light immediately at the remoteWakeup() call site, not on the next loop
+}
+
 void ledTask(){
-  static bool lit=false;
-  bool want=false;
-  if (USBDevice.suspended()){                       // wake-armed: blip BLIP_ON_MS out of every BLIP_PERIOD_MS
-    want = (millis() % BLIP_PERIOD_MS) < BLIP_ON_MS;
-  }
-  if (want != lit){ lit = want; ledWrite(lit ? WAKE_LED_ON : WAKE_LED_OFF); }   // write only on change
+  if (g_lit && millis()-g_pulseMs >= PULSE_MS){ g_lit = false; ledWrite(WAKE_LED_OFF); }
 }

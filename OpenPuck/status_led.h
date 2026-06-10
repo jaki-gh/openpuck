@@ -1,10 +1,11 @@
-// status_led.h -- LED indication of the wake-armed state.
+// status_led.h -- LED indication of wake activity.
 //
-// When the host puts the bus in suspend (PC asleep) the device is "wake-armed": input forwarding is gated off
-// and only the explicit gestures (Steam-button short press / controller connect) will wake the host (see
-// "Wake from sleep" in ARCHITECTURE.md). That state was previously invisible -- you couldn't tell whether the
-// puck considered the host asleep. ledTask() makes it visible: a short LED blip every ~2s while wake is armed,
-// LED off otherwise (normal operation keeps the LED dark; the blip duty is ~3% so it won't light up a bedroom).
+// The LED is DARK in all steady states -- including while wake is armed (host suspended) -- and flashes for
+// half a second at the moment a wake is actually sent (USBDevice.remoteWakeup() fired by a Steam-button short
+// press, a controller connect, or the boot-time wake). This turns the LED into a wake debugger you can read
+// from the couch: flash + PC stays asleep = the resume signal was sent and the HOST ignored it (fix on the
+// host: powercfg /deviceenablewake); no flash = the firmware never fired (it didn't see the gesture, or it
+// didn't consider the bus suspended).
 //
 // Board note: the sketch is built with the Feather nRF52840 variant, but the usual hardware is a SuperMini
 // "Pro Micro" clone. The Feather's user LED is P1.15 (D3, active high); the SuperMini's blue user LED is
@@ -19,8 +20,9 @@
 #define WAKE_LED_PIN_B 24            // SuperMini "Pro Micro" clone: P0.15 blue user LED (D24 in the Feather map)
 #endif
 #ifndef WAKE_LED_ON
-#define WAKE_LED_ON HIGH             // set LOW if your board's LED is wired active-low (blip pattern inverts)
+#define WAKE_LED_ON HIGH             // set LOW if your board's LED is wired active-low
 #endif
 
-void ledInit();   // call once from setup(): pins to output, LED off
-void ledTask();   // call every loop(): blip while USBDevice.suspended(), dark otherwise
+void ledInit();        // call once from setup(): pins to output, LED off
+void ledWakePulse();   // call at each USBDevice.remoteWakeup() site: LED on now, off after 500ms
+void ledTask();        // call every loop(): times out the pulse
