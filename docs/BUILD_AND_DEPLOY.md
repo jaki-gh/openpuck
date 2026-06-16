@@ -49,7 +49,6 @@ arduino-cli core install adafruit:nrf52 --additional-urls https://adafruit.githu
 From the repository root:
 
 ```bash
-./gen_version.sh   # optional: stamp the build with the current git hash + dirty flag (shown in the panel)
 arduino-cli compile -b adafruit:nrf52:feather52840 --build-property "build.extra_flags=-DNRF52840_XXAA {build.flags.usb} -DCFG_TUD_HID=4" OpenPuck
 ```
 
