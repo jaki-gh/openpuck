@@ -1,0 +1,103 @@
+name: Release
+
+# Triggers when you push a tag like v1.0.0 or v1.2.3
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write   # needed to create a GitHub Release and upload assets
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so gen_version.sh gets a real commit hash
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install adafruit-nrfutil
+        # Required by the Adafruit nRF52 build recipe to package the DFU zip.
+        run: pip install adafruit-nrfutil
+
+      - name: Install Adafruit nRF52 core
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config set board_manager.additional_urls \
+            https://adafruit.github.io/arduino-board-index/package_adafruit_index.json
+          arduino-cli core update-index
+          arduino-cli core install adafruit:nrf52
+
+      - name: Embed git version
+        # Writes OpenPuck/git_version.h so the WebUSB panel shows the exact
+        # commit hash this release was built from.
+        run: |
+          chmod +x gen_version.sh
+          ./gen_version.sh
+
+      - name: Compile OpenPuck
+        run: |
+          arduino-cli compile \
+            -b adafruit:nrf52:feather52840 \
+            --output-dir build \
+            --build-property "build.extra_flags=-DNRF52840_XXAA {build.flags.usb} -DCFG_TUD_HID=4" \
+            OpenPuck
+
+      - name: Rename output files to include the version tag
+        # Makes the download filenames self-describing, e.g. OpenPuck-v1.0.0.uf2
+        run: |
+          TAG=${GITHUB_REF_NAME}
+          ls build/
+          UF2=$(ls build/*.uf2 2>/dev/null | head -1)
+          ZIP=$(ls build/*.zip 2>/dev/null | head -1)
+          if [ -n "$UF2" ]; then
+            cp "$UF2" "build/OpenPuck-${TAG}.uf2"
+            echo "UF2_PATH=build/OpenPuck-${TAG}.uf2" >> $GITHUB_ENV
+          fi
+          if [ -n "$ZIP" ]; then
+            cp "$ZIP" "build/OpenPuck-${TAG}-dfu.zip"
+            echo "ZIP_PATH=build/OpenPuck-${TAG}-dfu.zip" >> $GITHUB_ENV
+          fi
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "OpenPuck ${{ github.ref_name }}"
+          tag_name: ${{ github.ref_name }}
+          body: |
+            ## OpenPuck ${{ github.ref_name }}
+
+            Pre-built firmware for the **nRF52840 Pro Micro** (Adafruit nRF52840 Feather-compatible boards).
+
+            ### Flashing
+
+            **UF2 drag-drop (easiest):**
+            1. Double-tap the RST button until the board mounts as `NRF52BOOT` or `UF2BOOT`
+            2. Drag `OpenPuck-${{ github.ref_name }}.uf2` onto the drive
+            3. The board reboots automatically — done
+
+            **DFU serial upload:**
+            Use `adafruit-nrfutil` with the `-dfu.zip` file and the board in DFU mode.
+
+            ### Build info
+            - Board: `adafruit:nrf52:feather52840`
+            - Commit: ${{ github.sha }}
+            - Flags: `-DNRF52840_XXAA -DCFG_TUD_HID=4`
+
+            See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) and [BUILD_AND_DEPLOY.md](https://github.com/${{ github.repository }}/blob/main/docs/BUILD_AND_DEPLOY.md) for full documentation.
+          files: |
+            ${{ env.UF2_PATH }}
+            ${{ env.ZIP_PATH }}
+          draft: false
+          prerelease: false
